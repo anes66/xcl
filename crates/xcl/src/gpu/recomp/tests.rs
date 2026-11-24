@@ -3366,7 +3366,7 @@ fn gpu_uma_import_check_at_init() {
     if !gpu_ready() {
         return;
     }
-    crate::hle::d3d12x::real::init().expect("real D3D12.X backend");
+    assert_eq!(crate::hle::d3d12x::backend(), crate::hle::d3d12x::Backend::Real, "real D3D12.X backend");
     let s = crate::hle::d3d12x::real::stats().uma_import_check;
     assert!(s.starts_with("ok") || s.starts_with("off"), "{s}");
 }
@@ -3388,7 +3388,7 @@ fn gpu_sparse_vram_descriptors_buffers_and_xmem() {
     if !gpu_ready() {
         return;
     }
-    crate::hle::d3d12x::real::init().expect("real D3D12.X backend");
+    assert_eq!(crate::hle::d3d12x::backend(), crate::hle::d3d12x::Backend::Real, "real D3D12.X backend");
     let u = crate::gpu::uma::get().expect("UMA");
     assert_eq!(u.shader_windows(), 4, "runtime layout has 4 shader windows");
     assert!(u.is_sparse_window(0) && u.is_sparse_window(1) && u.is_sparse_window(2), "windows 0..2 sparse VRAM");
