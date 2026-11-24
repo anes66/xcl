@@ -1657,6 +1657,8 @@ mod tests {
     fn placed_title_textures_share_vram_and_preserve_pixels() {
         let _vram_guard = super::super::vram::VRAM_TEST_LOCK.lock().unwrap();
         let _guard = TEST_LOCK.lock().unwrap();
+        // Agility must be selected before this test creates the process's first device.
+        let _ = crate::gpu::agility::state();
         use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
         use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
         use windows::Win32::Graphics::Dxgi::*;
