@@ -130,6 +130,16 @@ fn pipeline_journal_cli_compiles_and_resumes() {
         log
     };
     assert!(!cache.exists(), "first run must start without an application cache");
+    for prefix in [&b""[..], &b"XCL"[..]] {
+        let waiting = dir.join(format!("watch-{}.bin", prefix.len()));
+        std::fs::write(&waiting, prefix).unwrap();
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_xcl"))
+            .arg("pipelines").arg(&waiting).args(["--watch", "--limit", "0", "--threads", "1"])
+            .env("XCL_DXIL_CACHE", &cache).output().unwrap();
+        assert!(out.status.success() && String::from_utf8_lossy(&out.stdout).contains("made 0, failed 0"), "{out:?}");
+        assert_eq!(std::fs::metadata(waiting.with_extension("done")).unwrap().len(), 8);
+        assert!(!cache.exists() && !waiting.with_extension("trying").exists());
+    }
     for args in [&["--limit"][..], &["--limit", "bad"][..]] {
         let rejected = command().args(args).output().unwrap();
         assert_eq!(rejected.status.code(), Some(2), "invalid limit must not compile the journal: {rejected:?}");

@@ -201,6 +201,27 @@ pub fn run(target: &Path, args: &[String]) -> i32 {
             return 2;
         }
     };
+    let mut file = match std::fs::File::open(&journal) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("xcl pipelines: {}: {e}", journal.display());
+            return 2;
+        }
+    };
+    let mut magic = [0u8; pso_journal::MAGIC.len()];
+    match file.read_exact(&mut magic) {
+        Ok(()) if &magic == pso_journal::MAGIC => {}
+        // A watched journal may have been created before its first header write.
+        Err(e) if watch && e.kind() == std::io::ErrorKind::UnexpectedEof => {}
+        Err(e) if e.kind() != std::io::ErrorKind::UnexpectedEof => {
+            eprintln!("xcl pipelines: {}: {e}", journal.display());
+            return 2;
+        }
+        _ => {
+            eprintln!("xcl pipelines: {}: invalid pipeline journal header", journal.display());
+            return 2;
+        }
+    }
     let (dev, gpu_key) = match device(&adapter_setting(&journal)) {
         Ok(d) => d,
         Err(e) => {
@@ -224,13 +245,6 @@ pub fn run(target: &Path, args: &[String]) -> i32 {
     let gpu_most = std::env::var("XCL_PIPELINE_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or(if watch { 2 } else { 4usize }).max(1);
     let threads = threads.unwrap_or(half);
 
-    let mut file = match std::fs::File::open(&journal) {
-        Ok(f) => f,
-        Err(e) => {
-            eprintln!("xcl pipelines: {}: {e}", journal.display());
-            return 2;
-        }
-    };
     let q = Arc::new((Mutex::new(Queue::default()), Condvar::new()));
     // what an earlier run of this binary finished
     let done_path = journal.with_extension("done");
