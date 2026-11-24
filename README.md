@@ -119,6 +119,9 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
 xcl pipelines D:\Games\SomeTitle [--watch]  # compile the pipelines a run queued (<data>\cache\pipelines.bin)
 ```
 
+`xcl pipelines` checks saved compute blobs with the driver before marking them done; a refused
+blob is removed and the pipeline is compiled again, including after a driver change.
+
 - **Without a command line** (xcl.exe opened from Explorer) XCL shows a small menu: *Choose a
   game…* (pick its exe or `MicrosoftGame.config`) or *Run again* (the last one). On an error the
   window stays open until Enter.

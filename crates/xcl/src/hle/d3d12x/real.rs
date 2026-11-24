@@ -4222,17 +4222,28 @@ pub(crate) unsafe fn warm<G>(dev: &ID3D12Device, r: &super::pso_journal::Replay,
             copy.CachedPSO = D3D12_CACHED_PIPELINE_STATE::default();
             // the driver's result goes where `translated_compute_pso` looks for it (`driver_cache`)
             let disk = driver_cache::path(&compiled.dxil, copy.Flags.0);
-            if disk.as_deref().is_some_and(std::path::Path::is_file) {
-                return Ok(());
+            let cached = disk.as_deref().and_then(driver_cache::load);
+            if let Some(bytes) = &cached {
+                copy.CachedPSO = D3D12_CACHED_PIPELINE_STATE { pCachedBlob: bytes.as_ptr().cast(), CachedBlobSizeInBytes: bytes.len() };
             }
             // a big one as the title's background makes it: one at a time, within the commit left
             let _big = (compiled.dxil.len() >= BIG_DRIVER_COMPILE).then(|| big_compile_turn(&BIG_COMPILES, big_compile_commit_free, || false));
             let _slot = driver();
             let started = std::time::Instant::now();
-            let made = dev.CreateComputePipelineState::<ID3D12PipelineState>(&copy);
-            if let (Ok(p), Some(path)) = (&made, &disk) {
-                if let Ok(b) = p.GetCachedBlob() {
-                    driver_cache::keep(path, std::slice::from_raw_parts(b.GetBufferPointer() as *const u8, b.GetBufferSize()), started.elapsed());
+            let mut made = dev.CreateComputePipelineState::<ID3D12PipelineState>(&copy);
+            let from_cache = cached.is_some() && made.is_ok();
+            if cached.is_some() {
+                driver_cache::note(from_cache, disk.as_deref());
+                if !from_cache {
+                    copy.CachedPSO = D3D12_CACHED_PIPELINE_STATE::default();
+                    made = dev.CreateComputePipelineState::<ID3D12PipelineState>(&copy);
+                }
+            }
+            if !from_cache {
+                if let (Ok(p), Some(path)) = (&made, &disk) {
+                    if let Ok(b) = p.GetCachedBlob() {
+                        driver_cache::keep(path, std::slice::from_raw_parts(b.GetBufferPointer() as *const u8, b.GetBufferSize()), started.elapsed());
+                    }
                 }
             }
             made

@@ -155,6 +155,32 @@ fn pipeline_journal_cli_compiles_and_resumes() {
     std::fs::write(&done, stale).unwrap();
     run("made 1,", 0);
     assert_eq!(std::fs::read(&done).unwrap(), progress);
+    // A new binary/driver key must not accept an old blob merely because its file exists.
+    let dxil_file = std::fs::read_dir(&cache).unwrap().flatten().map(|e| e.path())
+        .find(|p| p.extension().is_some_and(|ext| ext == "dxil")).unwrap();
+    let dxil = std::fs::read(dxil_file).unwrap();
+    let driver_file = cache.join("driver").join(format!("{:016x}-{:x}-0.pso", xcl::gpu::shader::fnv64(&dxil), dxil.len()));
+    std::fs::create_dir_all(driver_file.parent().unwrap()).unwrap();
+    let invalid = b"invalid cached journal pipeline";
+    std::fs::write(&driver_file, invalid).unwrap();
+    std::fs::remove_file(&done).unwrap();
+    run("made 1,", 0);
+    assert_ne!(std::fs::read(&driver_file).ok().as_deref(), Some(invalid.as_slice()), "an invalid blob must be dropped or replaced");
+    assert_eq!(std::fs::read(&done).unwrap(), progress);
+    // Seed a valid blob through the existing offline compiler and require actual reuse.
+    let input = dir.join("input");
+    std::fs::create_dir(&input).unwrap();
+    std::fs::write(input.join("kernel.bin"), &blob).unwrap();
+    let seeded = std::process::Command::new(env!("CARGO_BIN_EXE_xcl"))
+        .arg("shaders").arg(&input).args(["--precompile", "--pipelines"])
+        .env("XCL_DXIL_CACHE", &cache).env("XCL_PIPELINE_THREADS", "1").output().unwrap();
+    assert!(seeded.status.success(), "{seeded:?}");
+    let valid = std::fs::read(&driver_file).unwrap();
+    assert!(!valid.is_empty());
+    std::fs::remove_file(&done).unwrap();
+    let reused = run("made 1,", 0);
+    assert!(reused.contains("compute pipelines made from the driver's blob"), "{reused}");
+    assert_eq!(std::fs::read(&driver_file).unwrap(), valid);
     // An incomplete compute payload cannot be replayed and must remain retryable.
     let mut broken = vec![b'C', 4, 0, 0];
     le(&mut broken, 8);
