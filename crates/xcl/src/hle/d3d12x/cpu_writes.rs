@@ -177,7 +177,8 @@ mod tests {
             assert!(writable(va, 8));
             after(q.as_raw(), vec![Write::Immediate(va, vec![7, 9])]);
             let t = std::time::Instant::now();
-            while (*(va as *const AtomicU32)).load(Ordering::Acquire) != 7 {
+            // The last release store publishes both dwords, not just the first one.
+            while (*((va + 4) as *const AtomicU32)).load(Ordering::Acquire) != 9 {
                 assert!(t.elapsed().as_secs() < 5, "never written");
                 std::thread::yield_now();
             }
