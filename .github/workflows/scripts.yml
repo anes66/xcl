@@ -1,0 +1,24 @@
+# Unit tests of the PR checker (scripts/pr_check.py): the merge gate itself, tested whenever it or
+# its tests change. Plain `pull_request` – the PR's own copy of the checker is what is tested here;
+# the gate that judges PRs is still main's (pr-check.yml).
+name: Scripts
+
+on:
+  push:
+    branches: [main]
+    paths: ["scripts/pr_check.py", "scripts/test_pr_check*.py", ".github/workflows/scripts.yml"]
+  pull_request:
+    paths: ["scripts/pr_check.py", "scripts/test_pr_check*.py", ".github/workflows/scripts.yml"]
+
+permissions:
+  contents: read
+
+jobs:
+  pr-check:
+    name: PR checker tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run the tests
+        run: python3 -m unittest discover -s scripts -p "test_pr_check*.py" -v
