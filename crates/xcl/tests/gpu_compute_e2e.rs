@@ -130,6 +130,17 @@ fn pipeline_journal_cli_compiles_and_resumes() {
         log
     };
     assert!(!cache.exists(), "first run must start without an application cache");
+    for args in [&["--limit"][..], &["--limit", "bad"][..]] {
+        let rejected = command().args(args).output().unwrap();
+        assert_eq!(rejected.status.code(), Some(2), "invalid limit must not compile the journal: {rejected:?}");
+        assert!(!journal.with_extension("done").exists() && !journal.with_extension("trying").exists());
+        assert!(!cache.exists());
+    }
+    let zero = command().args(["--limit", "0"]).output().unwrap();
+    assert!(zero.status.success() && String::from_utf8_lossy(&zero.stdout).contains("made 0, failed 0"), "{zero:?}");
+    assert_eq!(std::fs::metadata(journal.with_extension("done")).unwrap().len(), 8, "zero attempts: only the binary key");
+    assert!(!cache.exists() && !journal.with_extension("trying").exists());
+    std::fs::remove_file(journal.with_extension("done")).unwrap();
     run("made 1,", 0);
     let done = journal.with_extension("done");
     let progress = std::fs::read(&done).unwrap();

@@ -174,9 +174,26 @@ pub fn run(target: &Path, args: &[String]) -> i32 {
         println!("{HELP}");
         return 0;
     }
-    let opt = |k: &str| args.iter().position(|a| a == k).and_then(|i| args.get(i + 1)).and_then(|v| v.parse::<usize>().ok());
-    let watch = args.iter().any(|a| a == "--watch");
-    let limit = opt("--limit").unwrap_or(usize::MAX);
+    let (mut watch, mut limit, mut threads) = (false, None, None);
+    let mut rest = args.iter();
+    while let Some(arg) = rest.next() {
+        match arg.as_str() {
+            "--watch" => watch = true,
+            "--limit" | "--threads" => {
+                let n = rest.next().and_then(|v| v.parse::<usize>().ok()).filter(|&n| arg != "--threads" || n > 0);
+                let Some(n) = n else {
+                    eprintln!("xcl pipelines: {arg} needs {} integer", if arg == "--threads" { "a positive" } else { "a non-negative" });
+                    return 2;
+                };
+                if arg == "--limit" { limit.get_or_insert(n); } else { threads.get_or_insert(n); }
+            }
+            _ => {
+                eprintln!("xcl pipelines: unknown option {arg}");
+                return 2;
+            }
+        }
+    }
+    let limit = limit.unwrap_or(usize::MAX);
     let journal = match journal_of(target) {
         Ok(j) => j,
         Err(e) => {
@@ -205,7 +222,7 @@ pub fn run(target: &Path, args: &[String]) -> i32 {
     // the background of a PC in use, and a title's last pipelines take GBs each in DXC
     crate::gpu::recomp::dxc::set_memory_reserve(6);
     let gpu_most = std::env::var("XCL_PIPELINE_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or(if watch { 2 } else { 4usize }).max(1);
-    let threads = opt("--threads").unwrap_or(half).max(1);
+    let threads = threads.unwrap_or(half);
 
     let mut file = match std::fs::File::open(&journal) {
         Ok(f) => f,

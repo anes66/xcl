@@ -122,6 +122,8 @@ xcl pipelines D:\Games\SomeTitle [--watch]  # compile the pipelines a run queued
 `xcl pipelines` checks saved compute blobs with the driver before marking them done; a refused
 blob is removed and the pipeline is compiled again, including after a driver change.
 `xcl pipelines --help` (or `-h`) lists the pipeline options without a target path.
+`--threads` takes a positive integer and `--limit` a non-negative integer (0 attempts none).
+Missing or invalid values and unknown options stop the command instead of using defaults.
 
 - **Without a command line** (xcl.exe opened from Explorer) XCL shows a small menu: *Choose a
   game…* (pick its exe or `MicrosoftGame.config`) or *Run again* (the last one). On an error the
