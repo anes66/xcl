@@ -170,7 +170,7 @@ impl Queue {
 }
 
 pub fn run(target: &Path, args: &[String]) -> i32 {
-    if args.iter().any(|a| a == "--help" || a == "-h") {
+    if matches!(target.to_str(), Some("--help" | "-h")) || args.iter().any(|a| a == "--help" || a == "-h") {
         println!("{HELP}");
         return 0;
     }
