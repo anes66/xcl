@@ -81,6 +81,23 @@ fn console_cs(code: &[u8], rsrc2: u32, threads: [u32; 3]) -> Vec<u8> {
 
 const V: u64 = 256; // VALU source code of v0
 
+fn compute_journal(blob: &[u8]) -> (Vec<u8>, u64) {
+    let shader_hash = xcl::gpu::shader::fnv64(blob);
+    let mut payload = shader_hash.to_le_bytes().to_vec();
+    let desc_size = std::mem::size_of::<D3D12_COMPUTE_PIPELINE_STATE_DESC>();
+    le(&mut payload, desc_size as u32);
+    payload.resize(payload.len() + desc_size, 0);
+    let hash = xcl::gpu::shader::fnv64(&[payload.as_slice(), &[4]].concat());
+    let mut bytes = xcl::hle::d3d12x::pso_journal::MAGIC.to_vec();
+    for (tag, windows, hash, data) in [(b'S', 0, shader_hash, blob), (b'C', 4, hash, payload.as_slice()), (b'U', 0, hash, &[][..])] {
+        bytes.extend_from_slice(&[tag, windows, 0, 0]);
+        le(&mut bytes, data.len() as u32);
+        bytes.extend_from_slice(&hash.to_le_bytes());
+        bytes.extend_from_slice(data);
+    }
+    (bytes, hash)
+}
+
 #[test]
 fn pipeline_journal_cli_compiles_and_resumes() {
     let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
@@ -99,19 +116,7 @@ fn pipeline_journal_cli_compiles_and_resumes() {
     let cache = dir.join("dxil");
     let blob = console_cs(&program(), 2 << 1 | 1 << 7 | 1 << 8 | 1 << 11, [16, 8, 1]);
     let shader_hash = xcl::gpu::shader::fnv64(&blob);
-    // The journal stores the shader hash, desc size, then a pointer-free desc.
-    let mut payload = shader_hash.to_le_bytes().to_vec();
-    let desc_size = std::mem::size_of::<D3D12_COMPUTE_PIPELINE_STATE_DESC>();
-    le(&mut payload, desc_size as u32);
-    payload.resize(payload.len() + desc_size, 0);
-    let hash = xcl::gpu::shader::fnv64(&[payload.as_slice(), &[4]].concat());
-    let mut bytes = xcl::hle::d3d12x::pso_journal::MAGIC.to_vec();
-    for (tag, windows, hash, data) in [(b'S', 0, shader_hash, blob.as_slice()), (b'C', 4, hash, payload.as_slice()), (b'U', 0, hash, &[][..])] {
-        bytes.extend_from_slice(&[tag, windows, 0, 0]);
-        le(&mut bytes, data.len() as u32);
-        bytes.extend_from_slice(&hash.to_le_bytes());
-        bytes.extend_from_slice(data);
-    }
+    let (bytes, hash) = compute_journal(&blob);
     std::fs::write(&journal, bytes).unwrap();
     let command = || {
         let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_xcl"));
@@ -238,6 +243,67 @@ fn offline_compute_pipeline_is_reused_by_a_second_process() {
     run(true);
     let _ = fs::remove_dir_all(&dir);
     assert!(warm.contains("pipelines loaded from the driver cache 1"), "{warm}");
+}
+
+#[test]
+fn journal_warmer_reuses_offline_blobs_for_distinct_static_samplers() {
+    use std::{fs, process::Command};
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    if xcl::gpu::recomp::dxc::location().is_err() {
+        runner::skip_test("no DXC");
+        return;
+    }
+    if runner::wave64_programs_supported() != Ok(true) {
+        runner::skip_test("no GPU");
+        return;
+    }
+    let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+    let dir = std::env::temp_dir().join(format!("xcl-sampler-journal-{}-{nonce}", std::process::id()));
+    let (input, cache) = (dir.join("input"), dir.join("cache"));
+    fs::create_dir_all(&input).unwrap();
+    let mut journals = Vec::new();
+    for u in [0u32, 2] {
+        let words = [u | 2 << 3 | 2 << 6, 0x00ff_f000, 0, 0];
+        let mut code = Vec::new();
+        for (k, word) in words.into_iter().enumerate() {
+            let (src, literal) = if word == 0 { (128, None) } else { (255, Some(word)) };
+            code.extend(encode("S_MOV_B32", "ENC_SOP1", &[("SDST", 24 + k as u64), ("SSRC0", src)], literal).unwrap());
+        }
+        code.extend(encode("IMAGE_SAMPLE_LZ", "ENC_MIMG", &[("VDATA", 10), ("VADDR", 0), ("SRSRC", 4), ("SSAMP", 6), ("DMASK", 0xf), ("DIM", 1)], None).unwrap());
+        code.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+        let blob = console_cs(&code, 24 << 1 | 1 << 7, [4, 4, 1]);
+        fs::write(input.join(format!("sampler-{u}.bin")), &blob).unwrap();
+        let journal = dir.join(format!("sampler-{u}.bin"));
+        fs::write(&journal, compute_journal(&blob).0).unwrap();
+        journals.push(journal);
+    }
+    let seeded = Command::new(env!("CARGO_BIN_EXE_xcl")).arg("shaders").arg(&input)
+        .args(["--precompile", "--pipelines"]).env("XCL_DXIL_CACHE", &cache).env("XCL_PIPELINE_THREADS", "1").output().unwrap();
+    assert!(seeded.status.success(), "{seeded:?}");
+    let mut before: Vec<_> = fs::read_dir(cache.join("driver")).unwrap().flatten().map(|e| {
+        let path = e.path();
+        let bytes = fs::read(&path).unwrap();
+        (path, bytes)
+    }).collect();
+    before.sort();
+    assert_eq!(before.len(), 2, "two sampler states need two files");
+    for (_, bytes) in &before { assert!(!bytes.is_empty()); }
+    let prefix = |p: &std::path::Path| p.file_stem().unwrap().to_str().unwrap().rsplit_once('-').unwrap().0.to_owned();
+    assert_eq!(prefix(&before[0].0), prefix(&before[1].0), "DXIL hash, length and flags match; only sampler state differs");
+    let dxils: Vec<_> = fs::read_dir(&cache).unwrap().flatten().map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|ext| ext == "dxil")).map(|p| fs::read(p).unwrap()).collect();
+    assert!(!dxils.is_empty() && dxils.iter().all(|b| b == &dxils[0]), "both shaders produce the same DXIL bytes");
+    for journal in journals {
+        let out = Command::new(env!("CARGO_BIN_EXE_xcl")).arg("pipelines").arg(journal).args(["--threads", "1"])
+            .env("XCL_DXIL_CACHE", &cache).env("XCL_PIPELINE_THREADS", "1").output().unwrap();
+        let log = format!("{}\n{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+        println!("{log}");
+        assert!(out.status.success() && log.contains("made 1, failed 0"), "{log}");
+        assert!(log.contains("compute pipelines made from the driver's blob"), "{log}");
+    }
+    for (path, bytes) in before { assert_eq!(fs::read(path).unwrap(), bytes); }
+    assert_eq!(fs::read_dir(cache.join("driver")).unwrap().count(), 2);
+    fs::remove_dir_all(dir).unwrap();
 }
 
 /// 16×8 threads per group (two wave64s), s[0:1] = output base and row width, TGID_X/Y in

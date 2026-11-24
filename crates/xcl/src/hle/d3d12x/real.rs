@@ -1446,6 +1446,29 @@ pub(super) fn set_test_buffer_delta(res: usize, delta: Option<u64>) {
     }
 }
 
+/// Whether the PC's Map works on `res`: not a reserved resource, and its heap has CPU pages.
+unsafe fn pc_can_map(res: *mut c_void) -> bool {
+    !is_reserved(res) && pc_mappable(heap_properties(res))
+}
+
+/// The heap `res` lives in (not to be asked of a reserved resource).
+unsafe fn heap_properties(res: *mut c_void) -> Option<D3D12_HEAP_PROPERTIES> {
+    let r = ID3D12Resource::from_raw_borrowed(&res)?;
+    let mut p = D3D12_HEAP_PROPERTIES::default();
+    r.GetHeapProperties(Some(&mut p), None).ok().map(|_| p)
+}
+
+/// Whether the PC can map a resource in a heap with `props`: not a reserved one (no heap), not
+/// one in a DEFAULT heap, not one in a custom heap without CPU pages.
+fn pc_mappable(props: Option<D3D12_HEAP_PROPERTIES>) -> bool {
+    match props {
+        None => false,
+        Some(p) if p.Type == D3D12_HEAP_TYPE_DEFAULT => false,
+        Some(p) if p.Type == D3D12_HEAP_TYPE_CUSTOM => p.CPUPageProperty != D3D12_CPU_PAGE_PROPERTY_NOT_AVAILABLE,
+        Some(_) => true,
+    }
+}
+
 /// resource Release (every caller): a console buffer's unified memory goes with it
 /// Map: on the console every resource is CPU-visible memory. One in unified memory that the
 /// PC cannot map (a texture XCL keeps in step with it) gives its unified-memory address – what
@@ -1474,8 +1497,14 @@ unsafe extern "system" fn res_map(this: *mut c_void, sub: u32, range: *const c_v
         UNMAPPABLE.lock().unwrap().get_or_insert_with(HashSet::new).insert(this as usize);
         return S_OK;
     }
-    let f: unsafe extern "system" fn(*mut c_void, u32, *const c_void, *mut *mut c_void) -> HRESULT = std::mem::transmute(orig_fn(this, slot_of(this, "Map")));
-    let hr = f(this, sub, range, data);
+    // the PC's Map only on a resource it can map: on a reserved one or one without CPU pages it is
+    // an invalid call (debug layer 824 / 822) that the runtime answers with E_INVALIDARG
+    let hr = if pc_can_map(this) {
+        let f: unsafe extern "system" fn(*mut c_void, u32, *const c_void, *mut *mut c_void) -> HRESULT = std::mem::transmute(orig_fn(this, slot_of(this, "Map")));
+        f(this, sub, range, data)
+    } else {
+        E_INVALIDARG
+    };
     if hr >= 0 {
         return hr;
     }
@@ -1567,6 +1596,9 @@ unsafe extern "system" fn res_release(this: *mut c_void) -> u32 {
             s.remove(&(this as usize));
         }
         if let Some(s) = SPARSE_READBACK.lock().unwrap().as_mut() {
+            s.remove(&(this as usize));
+        }
+        if let Some(s) = RESERVED.lock().unwrap().as_mut() {
             s.remove(&(this as usize));
         }
         if let Some(m) = BUFFER_DELTA.lock().unwrap().as_mut() {
@@ -2419,6 +2451,7 @@ fn overrides(kind: Kind) -> Vec<(&'static str, usize)> {
             ("CreateStateObject", dev_create_state_object as usize),
             ("CreateCommittedResource2", dev_create_committed_resource2 as usize),
             ("CreatePlacedResource1", dev_create_placed_resource1 as usize),
+            ("CreateShaderCacheSession", dev_create_shader_cache_session as usize),
             ("CreateCommandQueue1", dev_create_command_queue1 as usize),
         ]),
         Kind::CommandList => v.extend_from_slice(&[
@@ -2852,8 +2885,42 @@ unsafe fn pc_allocation_size(device: *mut c_void, d: &[u8; 0x38]) -> u64 {
     r[0]
 }
 creator!(dev_create_placed_resource1, "CreatePlacedResource1", Kind::Resource, [a1, a2, a3, a4, a5]);
-creator!(dev_create_reserved_resource, "CreateReservedResource", Kind::Resource, [a1, a2, a3]);
-creator!(dev_create_reserved_resource1, "CreateReservedResource1", Kind::Resource, [a1, a2, a3, a4]);
+creator!(pc_create_reserved_resource, "CreateReservedResource", Kind::Resource, [a1, a2, a3]);
+creator!(pc_create_reserved_resource1, "CreateReservedResource1", Kind::Resource, [a1, a2, a3, a4]);
+
+/// Resources made with CreateReservedResource(1), with their description: they have no heap, so
+/// `res_map` asks none of them (GetHeapProperties on one is an invalid call too, debug layer
+/// 901). The description guards against an address a later resource reuses without the last
+/// Release having been seen.
+static RESERVED: Mutex<Option<HashMap<usize, D3D12_RESOURCE_DESC>>> = Mutex::new(None);
+
+unsafe fn desc_of(res: *mut c_void) -> Option<D3D12_RESOURCE_DESC> {
+    ID3D12Resource::from_raw_borrowed(&res).map(|r| r.GetDesc())
+}
+
+unsafe fn note_reserved(hr: HRESULT, ppv: *mut *mut c_void) -> HRESULT {
+    if hr >= 0 && !ppv.is_null() && !(*ppv).is_null() {
+        if let Some(d) = desc_of(*ppv) {
+            RESERVED.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, d);
+        }
+    }
+    hr
+}
+
+unsafe fn is_reserved(res: *mut c_void) -> bool {
+    let kept = RESERVED.lock().unwrap().as_ref().and_then(|m| m.get(&(res as usize)).copied());
+    kept.is_some_and(|k| desc_of(res) == Some(k))
+}
+
+/// CreateReservedResource
+pub(super) unsafe extern "system" fn dev_create_reserved_resource(this: *mut c_void, a1: usize, a2: usize, a3: usize, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
+    note_reserved(pc_create_reserved_resource(this, a1, a2, a3, riid, ppv), ppv)
+}
+
+/// CreateReservedResource1
+pub(super) unsafe extern "system" fn dev_create_reserved_resource1(this: *mut c_void, a1: usize, a2: usize, a3: usize, a4: usize, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
+    note_reserved(pc_create_reserved_resource1(this, a1, a2, a3, a4, riid, ppv), ppv)
+}
 creator!(dev_create_heap_pc, "CreateHeap", Kind::Heap, [a1]);
 
 /// D3D12_HEAP_FLAGS the PC knows: SHARED 0x1, DENY_BUFFERS 0x4, ALLOW_DISPLAY 0x8,
@@ -3129,6 +3196,30 @@ creator!(dev_create_query_heap, "CreateQueryHeap", Kind::QueryHeap, [a1]);
 creator!(dev_create_command_signature, "CreateCommandSignature", Kind::CommandSignature, [a1, a2]);
 creator!(dev_create_pipeline_library, "CreatePipelineLibrary", Kind::PipelineLibrary, [a1, a2]);
 creator!(dev_create_state_object, "CreateStateObject", Kind::StateObject, [a1]);
+
+unsafe extern "system" fn dev_create_shader_cache_session(
+    this: *mut c_void,
+    desc: *const D3D12_SHADER_CACHE_SESSION_DESC,
+    riid: *const GUID,
+    ppv: *mut *mut c_void,
+) -> HRESULT {
+    type F = unsafe extern "system" fn(*mut c_void, *const D3D12_SHADER_CACHE_SESSION_DESC, *const GUID, *mut *mut c_void) -> HRESULT;
+    let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "CreateShaderCacheSession")));
+    let hr = f(this, desc, riid, ppv);
+    if hr >= 0 {
+        return hr;
+    }
+    let fb = super::shader_cache_session::create_fallback(this, desc, riid as *const windows::core::GUID, ppv);
+    if fb >= 0 {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            crate::xlog_info!("D3D12.X: CreateShaderCacheSession failed on the PC runtime ({hr:#x}) – using an in-memory session");
+        });
+        fb
+    } else {
+        hr
+    }
+}
 
 // ---------------------------------------------------------------------------------------
 // pipeline states: capture + fallback
@@ -3493,7 +3584,7 @@ unsafe fn translated_compute_pso(this: *mut c_void, f: PsoFn, desc: *const c_voi
     let key = compute_blob_key(&dxil, rs as usize, copy.Flags.0);
     let mut cached = compute_blob(key);
     // … and one built in an earlier run gets the blob kept on disk then (`driver_cache`)
-    let disk = driver_cache::path(&dxil, copy.Flags.0);
+    let disk = driver_cache::path(&dxil, copy.Flags.0, &compiled.samplers);
     let from_disk = cached.is_none();
     if from_disk {
         cached = disk.as_deref().and_then(driver_cache::load).map(std::sync::Arc::new);
@@ -3549,11 +3640,12 @@ unsafe fn translated_compute_pso(this: *mut c_void, f: PsoFn, desc: *const c_voi
 /// run still goes through the driver's compiler. On an NVIDIA GPU that is 5 – 27 s for each of
 /// a retail title's larger compute programs when its world loads: the title dispatches without
 /// them meanwhile and is ended before all are built, so the next run starts the same compiles
-/// again. A blob whose build took `KEEP` or longer is written under the hash of its DXIL and
-/// its flags (`<DXIL cache>\driver\`) and read when a later run has none in memory; the
-/// driver refuses the blob of another driver, adapter or root signature (the file is dropped
-/// and the program compiled as before). `XCL_PSO_DISK_CACHE=0`: off.
+/// again. A blob whose build took `KEEP` or longer is written under its DXIL hash, flags and
+/// root signature's static samplers (`<DXIL cache>\driver\`) and read when a later run has
+/// none in memory. The driver can refuse a blob (for example, from another adapter or driver);
+/// the file is dropped and the program compiled again. `XCL_PSO_DISK_CACHE=0`: off.
 pub(crate) mod driver_cache {
+    use crate::gpu::recomp::pso::StaticSampler;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -3563,14 +3655,26 @@ pub(crate) mod driver_cache {
     static STALE: AtomicU64 = AtomicU64::new(0);
     static STORED: AtomicU64 = AtomicU64::new(0);
 
-    /// The file of the pipeline made from `dxil` with `flags`.
-    pub fn name(dxil: &[u8], flags: i32) -> String {
-        format!("{:016x}-{:x}-{:x}.pso", crate::gpu::shader::fnv64(dxil), dxil.len(), flags)
+    /// Sampler state lives in the root signature, so identical DXIL can have different samplers.
+    pub fn name(dxil: &[u8], flags: i32, samplers: &[StaticSampler]) -> String {
+        use crate::gpu::shader::fnv64;
+        let code_hash = fnv64(dxil);
+        if samplers.is_empty() {
+            return format!("{code_hash:016x}-{:x}-{flags:x}.pso", dxil.len());
+        }
+        // The sampler's position determines its shader register.
+        let sampler_bytes: Vec<u8> = samplers.iter()
+            .flat_map(|(words, compare)| words.iter().copied().chain([u32::from(*compare)]))
+            .flat_map(u32::to_le_bytes)
+            .collect();
+        let sampler_hash = fnv64(&sampler_bytes);
+        format!("{code_hash:016x}-{:x}-{flags:x}-{sampler_hash:016x}.pso", dxil.len())
     }
 
-    pub fn path(dxil: &[u8], flags: i32) -> Option<PathBuf> {
+    pub fn path(dxil: &[u8], flags: i32, samplers: &[StaticSampler]) -> Option<PathBuf> {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        ON.get_or_init(|| std::env::var("XCL_PSO_DISK_CACHE").map_or(true, |v| v.trim() != "0")).then(|| crate::gpu::recomp::dxc::cache_dir().join("driver").join(name(dxil, flags)))
+        ON.get_or_init(|| std::env::var("XCL_PSO_DISK_CACHE").map_or(true, |v| v.trim() != "0"))
+            .then(|| crate::gpu::recomp::dxc::cache_dir().join("driver").join(name(dxil, flags, samplers)))
     }
 
     pub fn load(p: &Path) -> Option<Vec<u8>> {
@@ -3650,17 +3754,30 @@ pub(crate) mod driver_cache {
         }
         #[test]
         fn a_file_is_named_after_its_dxil_and_flags() {
-            assert_eq!(name(b"abc", 0), name(b"abc", 0));
-            assert_ne!(name(b"abc", 0), name(b"abd", 0));
-            assert_ne!(name(b"abc", 0), name(b"abc", 1));
+            assert_eq!(name(b"abc", 0, &[]), "e71fa2190541574b-3-0.pso");
+            assert_ne!(name(b"abc", 0, &[]), name(b"abd", 0, &[]));
+            assert_ne!(name(b"abc", 0, &[]), name(b"abc", 1, &[]));
             // (the length is in the name: two programs of one hash and different lengths differ)
-            assert!(name(&[0u8; 0x1234], 2).ends_with("-1234-2.pso"));
+            assert!(name(&[0u8; 0x1234], 2, &[]).ends_with("-1234-2.pso"));
+        }
+
+        #[test]
+        fn identical_dxil_with_different_static_samplers_uses_separate_files() {
+            let wrap = ([0, 0, 0, 0], false);
+            let clamp_u = ([2, 0, 0, 0], false);
+            let comparison = (wrap.0, true);
+            let file = |samplers: &[StaticSampler]| name(b"program", 0, samplers);
+
+            assert_ne!(file(&[]), file(&[wrap]));
+            assert_ne!(file(&[wrap]), file(&[clamp_u]));
+            assert_ne!(file(&[wrap]), file(&[comparison]));
+            assert_ne!(file(&[wrap, clamp_u]), file(&[clamp_u, wrap]));
         }
 
         #[test]
         fn a_kept_blob_is_read_back_and_a_refused_one_is_dropped() {
             let dir = std::env::temp_dir().join(format!("xcl-driver-cache-test-{}", std::process::id()));
-            let p = dir.join("driver").join(name(b"program", 0));
+            let p = dir.join("driver").join(name(b"program", 0, &[]));
             assert_eq!(load(&p), None, "nothing kept yet");
             assert!(!write(&p, &[]), "an empty blob is not kept");
             keep(&p, &[1, 2, 3], std::time::Duration::from_millis(10));
@@ -4221,7 +4338,7 @@ pub(crate) unsafe fn warm<G>(dev: &ID3D12Device, r: &super::pso_journal::Replay,
             copy.CS = bytecode(&compiled.dxil);
             copy.CachedPSO = D3D12_CACHED_PIPELINE_STATE::default();
             // the driver's result goes where `translated_compute_pso` looks for it (`driver_cache`)
-            let disk = driver_cache::path(&compiled.dxil, copy.Flags.0);
+            let disk = driver_cache::path(&compiled.dxil, copy.Flags.0, &compiled.samplers);
             let cached = disk.as_deref().and_then(driver_cache::load);
             if let Some(bytes) = &cached {
                 copy.CachedPSO = D3D12_CACHED_PIPELINE_STATE { pCachedBlob: bytes.as_ptr().cast(), CachedBlobSizeInBytes: bytes.len() };
@@ -6127,6 +6244,85 @@ mod console_format_query_tests {
             assert!(hr >= 0 && !p.is_null(), "D16S8 target with a 118 clear value: {hr:#x}");
             let r = ID3D12Resource::from_raw(p);
             assert_eq!(r.GetDesc().Format.0, 44, "made R24G8_TYPELESS");
+        }
+    }
+}
+
+#[cfg(test)]
+mod map_tests {
+    use super::*;
+
+    /// A title's Map reaches the PC's only for a resource the PC can map: a buffer in an upload,
+    /// readback or CPU-visible custom heap. One in a DEFAULT heap, a custom heap without CPU pages
+    /// or a reserved one gets its title address instead (the PC's Map on it is an invalid call).
+    #[test]
+    fn only_resources_with_cpu_pages_go_to_the_pc_map() {
+        unsafe {
+            let mut dev: Option<ID3D12Device> = None;
+            if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+                return; // no D3D12 adapter
+            }
+            let dev = dev.unwrap();
+            let buffer = |props: D3D12_HEAP_PROPERTIES, state: D3D12_RESOURCE_STATES| -> ID3D12Resource {
+                let desc = D3D12_RESOURCE_DESC {
+                    Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                    Width: 0x1_0000,
+                    Height: 1,
+                    DepthOrArraySize: 1,
+                    MipLevels: 1,
+                    SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                    Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                    ..Default::default()
+                };
+                let mut r: Option<ID3D12Resource> = None;
+                dev.CreateCommittedResource(&props, D3D12_HEAP_FLAG_NONE, &desc, state, None, &mut r).expect("buffer");
+                r.unwrap()
+            };
+            let heap = |t| D3D12_HEAP_PROPERTIES { Type: t, ..Default::default() };
+            let mappable = |r: &ID3D12Resource| pc_can_map(r.as_raw());
+
+            assert!(mappable(&buffer(heap(D3D12_HEAP_TYPE_UPLOAD), D3D12_RESOURCE_STATE_GENERIC_READ)));
+            assert!(mappable(&buffer(heap(D3D12_HEAP_TYPE_READBACK), D3D12_RESOURCE_STATE_COPY_DEST)));
+            let default = buffer(heap(D3D12_HEAP_TYPE_DEFAULT), D3D12_RESOURCE_STATE_COMMON);
+            assert!(!mappable(&default));
+            // (what the PC answers there – the call this keeps from being made)
+            let mut p = std::ptr::null_mut();
+            assert!(default.Map(0, None, Some(&mut p)).is_err(), "a DEFAULT-heap buffer is not mappable on the PC");
+
+            let custom = |page| D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_CUSTOM, CPUPageProperty: page, MemoryPoolPreference: D3D12_MEMORY_POOL_L0, ..Default::default() };
+            assert!(mappable(&buffer(custom(D3D12_CPU_PAGE_PROPERTY_WRITE_BACK), D3D12_RESOURCE_STATE_COMMON)));
+            assert!(!mappable(&buffer(custom(D3D12_CPU_PAGE_PROPERTY_NOT_AVAILABLE), D3D12_RESOURCE_STATE_COMMON)));
+
+            // a reserved resource has no heap
+            let desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                Width: 256,
+                Height: 256,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8G8B8A8_UNORM,
+                SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Layout: D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE,
+                ..Default::default()
+            };
+            let mut reserved: Option<ID3D12Resource> = None;
+            if dev.CreateReservedResource(&desc, D3D12_RESOURCE_STATE_COMMON, None, &mut reserved).is_ok() {
+                let r = reserved.unwrap();
+                let mut raw = r.as_raw();
+                // what dev_create_reserved_resource does with what the PC made
+                note_reserved(S_OK, &mut raw);
+                assert!(is_reserved(raw) && !pc_can_map(raw), "a reserved resource is not asked for its heap");
+                // a buffer at an address a reserved resource left without its last Release seen
+                // is not taken for it (its description differs)
+                let upload = buffer(heap(D3D12_HEAP_TYPE_UPLOAD), D3D12_RESOURCE_STATE_GENERIC_READ);
+                let stale = desc_of(r.as_raw()).unwrap();
+                RESERVED.lock().unwrap().as_mut().unwrap().insert(upload.as_raw() as usize, stale);
+                assert!(!is_reserved(upload.as_raw()) && mappable(&upload));
+                let mut g = RESERVED.lock().unwrap();
+                let m = g.as_mut().unwrap();
+                m.remove(&(raw as usize));
+                m.remove(&(upload.as_raw() as usize));
+            }
         }
     }
 }

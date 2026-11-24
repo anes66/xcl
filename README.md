@@ -131,6 +131,8 @@ blob is removed and the pipeline is compiled again, including after a driver cha
 - **The game folder is never modified** – writes go to the overlay.
 - Translated shaders are reused across XCL rebuilds when the translator sources and DXC
   toolchain are unchanged; `XCL_TRANSLATED_CACHE=0` disables that disk cache.
+- `xcl shaders <pack> --precompile --pipelines` saves driver blobs for reuse by the title, keeping
+  compute pipelines with different static sampler states separate even when they share a shader.
 - With `XCL_DRED=1`, a D3D12 device removal logs GPU breadcrumbs in `xcl.log`.
   XCL examines up to 4,096 command lists and reports up to 64 unfinished lists, starting with
   those on which the GPU completed at least one operation.
