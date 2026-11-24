@@ -29,6 +29,26 @@ try {
     '{"d3d12":{"last_frame_dump":null}}' | Set-Content -LiteralPath $report -Encoding utf8
     Assert-Eq 'no dump' (Get-XclSmokeLit $report) 'n/a'
     Assert-Eq 'missing file' (Get-XclSmokeLit (Join-Path $dir 'nope.json')) 'n/a'
+    $invalid = Join-Path $dir 'invalid.exe'
+    [IO.File]::WriteAllText($invalid, 'not an executable')
+    $savedFrameDump = $env:XCL_FRAME_DUMP
+    try {
+        $env:XCL_FRAME_DUMP = '37'
+        $failed = $false
+        try {
+            & (Join-Path $PSScriptRoot 'smoke.ps1') -Game $dir -Xcl $invalid -Seconds 1 | Out-Null
+        } catch {
+            $failed = $true
+        }
+        if (-not $failed) { throw 'Invalid executable did not fail to start.' }
+        Assert-Eq 'caller frame dump after a failed start' $env:XCL_FRAME_DUMP '37'
+    } finally {
+        if ($null -eq $savedFrameDump) {
+            Remove-Item Env:XCL_FRAME_DUMP -ErrorAction SilentlyContinue
+        } else {
+            $env:XCL_FRAME_DUMP = $savedFrameDump
+        }
+    }
 } finally {
     Remove-Item -LiteralPath $dir -Recurse -Force
 }

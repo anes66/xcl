@@ -37,8 +37,7 @@ $p.StartInfo = $psi
 $env:XCL_NETWORK = '0'
 $env:XCL_RUN_SECONDS = "$Seconds"
 $env:XCL_ACTIVITY = '1'
-$savedFrameDump = $env:XCL_FRAME_DUMP
-$env:XCL_FRAME_DUMP = '120'
+$psi.EnvironmentVariables['XCL_FRAME_DUMP'] = '120'
 $null = $p.Start()
 $stdoutTask = $p.StandardOutput.ReadToEndAsync()
 $stderrTask = $p.StandardError.ReadToEndAsync()
@@ -49,8 +48,7 @@ if (-not $p.WaitForExit(($Seconds + 120) * 1000)) {
 $p.WaitForExit()
 $stdout = $stdoutTask.Result
 $null = $stderrTask.Result
-Remove-Item Env:XCL_RUN_SECONDS, Env:XCL_ACTIVITY, Env:XCL_FRAME_DUMP
-if ($null -ne $savedFrameDump) { $env:XCL_FRAME_DUMP = $savedFrameDump }
+Remove-Item Env:XCL_RUN_SECONDS, Env:XCL_ACTIVITY
 
 $logLine = ($stdout -split "`n" | Where-Object { $_ -match '^Log:\s+(.+)$' } | Select-Object -Last 1)
 if (-not $logLine) { throw "XCL printed no log path; its output:`n$stdout" }
