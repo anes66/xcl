@@ -84,6 +84,11 @@ const V: u64 = 256; // VALU source code of v0
 #[test]
 fn offline_compute_pipeline_is_reused_by_a_second_process() {
     use std::{fs, process::Command};
+    const RUNTIME_CHILD: &str = "XCL_TEST_OFFLINE_RUNTIME_CACHE";
+    if std::env::var_os(RUNTIME_CHILD).is_some() {
+        console_wave64_compute_through_the_pso_hook_dispatch_and_read_back();
+        return;
+    }
     let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     if xcl::gpu::recomp::dxc::location().is_err() {
         runner::skip_test("no DXC");
@@ -117,6 +122,18 @@ fn offline_compute_pipeline_is_reused_by_a_second_process() {
     let driver_file = cache.join("driver").join(name);
     assert!(driver_file.metadata().unwrap().len() > 0);
     let warm = run(true);
+    // A fresh runtime must consume the offline blob and still dispatch correct results.
+    let runtime = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "offline_compute_pipeline_is_reused_by_a_second_process", "--nocapture"])
+        .env(RUNTIME_CHILD, "1")
+        .env("XCL_DXIL_CACHE", &cache)
+        .env("XCL_PSO_DISK_CACHE", "1")
+        .output().unwrap();
+    let runtime_stdout = String::from_utf8_lossy(&runtime.stdout);
+    let runtime_stderr = String::from_utf8_lossy(&runtime.stderr);
+    assert!(runtime.status.success(), "{runtime_stdout}\n{runtime_stderr}");
+    assert!(runtime_stderr.contains("1 compute pipelines made from the driver's blob of an earlier run"),
+            "runtime did not reuse the offline pipeline: {runtime_stdout}\n{runtime_stderr}");
     // A blob from an earlier driver can be refused. The normal build must still succeed.
     fs::write(&driver_file, b"invalid cached pipeline").unwrap();
     run(true);
