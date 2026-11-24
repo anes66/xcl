@@ -203,6 +203,18 @@ impl Module {
         }
     }
 
+    /// The bits of a 32-bit float constant (a null float is +0).
+    fn const_f32(&self, v: Value) -> Option<u32> {
+        match v {
+            Value::Const(c) => match self.consts[c as usize] {
+                ConstDef::Float(t, x) if self.types[t.0 as usize] == TypeDef::Float => Some(x as u32),
+                ConstDef::Null(t) if self.types[t.0 as usize] == TypeDef::Float => Some(0),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
     /// Cheap algebraic & constant simplification on already-resolved operands.
     fn simplify_op(&mut self, op: &Op, ty: Ty, table: &HashMap<(Op, Ty), Value>) -> Option<Value> {
         // Keep f64 instructions intact so Doubles / DoubleExtensions shader flags stay consistent.
@@ -296,6 +308,33 @@ impl Module {
                     }
                 }
                 None
+            }
+            Op::Cmp(p, a, b) if (p as u32) < 16 => {
+                // two float constants; not a denormal, which a driver may flush to zero
+                let normal = |x: u32| x & 0x7F80_0000 != 0 || x & 0x007F_FFFF == 0;
+                let (x, y) = (self.const_f32(a).filter(|&x| normal(x))?, self.const_f32(b).filter(|&y| normal(y))?);
+                let (x, y) = (f32::from_bits(x), f32::from_bits(y));
+                let uno = x.is_nan() || y.is_nan();
+                let r = match p {
+                    Pred::FFalse => false,
+                    Pred::FTrue => true,
+                    Pred::FOrd => !uno,
+                    Pred::FUno => uno,
+                    Pred::FOEq => x == y,
+                    Pred::FOGt => x > y,
+                    Pred::FOGe => x >= y,
+                    Pred::FOLt => x < y,
+                    Pred::FOLe => x <= y,
+                    Pred::FONe => !uno && x != y,
+                    Pred::FUEq => uno || x == y,
+                    Pred::FUGt => uno || x > y,
+                    Pred::FUGe => uno || x >= y,
+                    Pred::FULt => uno || x < y,
+                    Pred::FULe => uno || x <= y,
+                    Pred::FUNe => uno || x != y,
+                    _ => return None,
+                };
+                Some(self.const_int(ty, r as u64))
             }
             Op::Cmp(p, a, b) => {
                 let at = self.value_ty(a);
