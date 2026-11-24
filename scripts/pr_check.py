@@ -68,6 +68,12 @@ def field_problems(block, run):
     return out
 
 
+def lit_percent(s):
+    """The `lit at end` percentage, or None when the line is missing or `n/a`."""
+    m = re.match(r"\s*(\d+(?:\.\d+)?)", s or "")
+    return float(m.group(1)) if m else None
+
+
 def runtime(path):
     return path.startswith("crates/xcl/src/") and "/tests" not in path and not path.endswith("tests.rs")
 
@@ -160,6 +166,11 @@ def check(body, head, files, is_main_ancestor, *, test_only=False):
                     pc, mc = number(pr.get("peak commit")), number(m.get("peak commit"))
                     if pc and mc and pc > COMMIT_GROWTH * mc:
                         problems.append(f"the PR's run commits much more memory than main's ({pc} MB against {mc} MB)")
+                    # older blocks have no `lit at end` line; n/a means no frame was sampled
+                    pl, ml = lit_percent(pr.get("lit at end")), lit_percent(m.get("lit at end"))
+                    if pl is not None and ml is not None and ml > 50 and pl < 1:
+                        problems.append(f"the PR's last sampled frame is dark ({pr.get('lit at end')}) "
+                                        f"while main's is lit ({m.get('lit at end')})")
     return problems
 
 

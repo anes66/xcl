@@ -4,13 +4,16 @@
 #
 #   .\scripts\smoke.ps1 -Game 'D:\Games\SomeTitle' [-Seconds 60] [-Xcl .\target\release\xcl.exe]
 #
-# Networking is off (XCL_NETWORK=0). Build first: cargo build --release -p xcl
+# Networking is off (XCL_NETWORK=0). One frame in 120 is sampled (XCL_FRAME_DUMP) and the
+# block's `lit at end` line is that frame's non-black share (`n/a` if none was sampled).
+# Build first: cargo build --release -p xcl
 param(
     [Parameter(Mandatory = $true)][string]$Game,
     [int]$Seconds = 60,
     [string]$Xcl = (Join-Path $PSScriptRoot '..\target\release\xcl.exe')
 )
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'smoke_lit.ps1')
 
 if (-not (Test-Path $Xcl)) { throw "no $Xcl - build it first (cargo build --release -p xcl)" }
 $root = Split-Path $PSScriptRoot -Parent
@@ -34,6 +37,8 @@ $p.StartInfo = $psi
 $env:XCL_NETWORK = '0'
 $env:XCL_RUN_SECONDS = "$Seconds"
 $env:XCL_ACTIVITY = '1'
+$savedFrameDump = $env:XCL_FRAME_DUMP
+$env:XCL_FRAME_DUMP = '120'
 $null = $p.Start()
 $stdoutTask = $p.StandardOutput.ReadToEndAsync()
 $stderrTask = $p.StandardError.ReadToEndAsync()
@@ -44,7 +49,8 @@ if (-not $p.WaitForExit(($Seconds + 120) * 1000)) {
 $p.WaitForExit()
 $stdout = $stdoutTask.Result
 $null = $stderrTask.Result
-Remove-Item Env:XCL_RUN_SECONDS, Env:XCL_ACTIVITY
+Remove-Item Env:XCL_RUN_SECONDS, Env:XCL_ACTIVITY, Env:XCL_FRAME_DUMP
+if ($null -ne $savedFrameDump) { $env:XCL_FRAME_DUMP = $savedFrameDump }
 
 $logLine = ($stdout -split "`n" | Where-Object { $_ -match '^Log:\s+(.+)$' } | Select-Object -Last 1)
 if (-not $logLine) { throw "XCL printed no log path; its output:`n$stdout" }
@@ -81,5 +87,6 @@ presents per 2 s (last 3): $lastPresents
 device removals: $removals
 crashes: $crashes
 peak commit: $peak MB
+lit at end: $(Get-XclSmokeLit $report)
 ``````
 "@

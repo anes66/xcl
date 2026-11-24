@@ -136,5 +136,48 @@ class TemplatePlaceholderTests(unittest.TestCase):
         self.assertEqual(3, len(problems))
 
 
+def smoke_body(pr_lit, main_lit, pr_line=True, main_line=True):
+    def block(commit, lit, include):
+        line = f"\nlit at end: {lit}" if include else ""
+        return (
+            "```\n"
+            "xcl-smoke v1\n"
+            f"commit: {commit}\n"
+            "gpu: test\n"
+            "title: game\n"
+            "seconds: 20\n"
+            "exit: 0x0\n"
+            "frames shown: 100 (PresentX 100)\n"
+            "device removals: 0\n"
+            "crashes: 0\n"
+            f"peak commit: 1000 MB{line}\n"
+            "```\n"
+        )
+
+    return BODY + "\n**Regression run**\n" + block("abcdef1234567890", main_lit, main_line) + block(HEAD, pr_lit, pr_line)
+
+
+class LitFrameTests(unittest.TestCase):
+    def problems(self, body):
+        return check(body, HEAD, [changed("crates/xcl/src/hle/d3d12x/present.rs")], lambda sha: sha.startswith("abcdef"))
+
+    def test_a_dark_frame_against_a_lit_main_is_refused(self):
+        problems = self.problems(smoke_body("0 %", "80 %"))
+        self.assertEqual(1, len(problems))
+        self.assertIn("dark", problems[0])
+
+    def test_a_fraction_under_one_percent_is_dark(self):
+        problems = self.problems(smoke_body("0.4 %", "60 %"))
+        self.assertEqual(1, len(problems))
+
+    def test_a_lit_frame_passes(self):
+        self.assertEqual([], self.problems(smoke_body("90 %", "80 %")))
+
+    def test_missing_or_unsampled_lines_are_left_alone(self):
+        self.assertEqual([], self.problems(smoke_body("0 %", "80 %", pr_line=False)))
+        self.assertEqual([], self.problems(smoke_body("n/a", "80 %")))
+        self.assertEqual([], self.problems(smoke_body("0 %", "40 %")))
+
+
 if __name__ == "__main__":
     unittest.main()
