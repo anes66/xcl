@@ -82,6 +82,96 @@ fn console_cs(code: &[u8], rsrc2: u32, threads: [u32; 3]) -> Vec<u8> {
 const V: u64 = 256; // VALU source code of v0
 
 #[test]
+fn pipeline_journal_cli_compiles_and_resumes() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    if xcl::gpu::recomp::dxc::location().is_err() {
+        runner::skip_test("no DXC");
+        return;
+    }
+    if runner::wave64_programs_supported() != Ok(true) {
+        runner::skip_test("no wave64");
+        return;
+    }
+    let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+    let dir = std::env::temp_dir().join(format!("xcl_pipeline_cli_{}_{stamp}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let journal = dir.join("pipelines.bin");
+    let cache = dir.join("dxil");
+    let blob = console_cs(&program(), 2 << 1 | 1 << 7 | 1 << 8 | 1 << 11, [16, 8, 1]);
+    let shader_hash = xcl::gpu::shader::fnv64(&blob);
+    // The journal stores the shader hash, desc size, then a pointer-free desc.
+    let mut payload = shader_hash.to_le_bytes().to_vec();
+    let desc_size = std::mem::size_of::<D3D12_COMPUTE_PIPELINE_STATE_DESC>();
+    le(&mut payload, desc_size as u32);
+    payload.resize(payload.len() + desc_size, 0);
+    let hash = xcl::gpu::shader::fnv64(&[payload.as_slice(), &[4]].concat());
+    let mut bytes = xcl::hle::d3d12x::pso_journal::MAGIC.to_vec();
+    for (tag, windows, hash, data) in [(b'S', 0, shader_hash, blob.as_slice()), (b'C', 4, hash, payload.as_slice()), (b'U', 0, hash, &[][..])] {
+        bytes.extend_from_slice(&[tag, windows, 0, 0]);
+        le(&mut bytes, data.len() as u32);
+        bytes.extend_from_slice(&hash.to_le_bytes());
+        bytes.extend_from_slice(data);
+    }
+    std::fs::write(&journal, bytes).unwrap();
+    let command = || {
+        let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_xcl"));
+        cmd.arg("pipelines").arg(&journal).args(["--threads", "1"])
+            .env("XCL_DXIL_CACHE", &cache).env("XCL_PIPELINE_THREADS", "1");
+        cmd
+    };
+    let run = |expected: &str, failed: usize| {
+        let out = command().output().unwrap();
+        let log = format!("{}\n{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+        println!("{log}");
+        assert!(out.status.success(), "{log}");
+        assert!(log.contains(expected), "{log}");
+        assert!(log.contains(&format!("failed {failed},")), "{log}");
+        assert!(!journal.with_extension("trying").exists(), "a clean exit must remove in-flight state");
+        log
+    };
+    assert!(!cache.exists(), "first run must start without an application cache");
+    run("made 1,", 0);
+    let done = journal.with_extension("done");
+    let progress = std::fs::read(&done).unwrap();
+    assert_eq!(progress.len(), 16, "binary key and one completed pipeline");
+    assert_eq!(&progress[8..], &hash.to_le_bytes());
+    // The second process must refuse a progress file held by another writer.
+    use std::os::windows::fs::OpenOptionsExt;
+    let held = std::fs::OpenOptions::new().read(true).write(true).share_mode(1).open(&done).unwrap();
+    let refused = command().output().unwrap();
+    assert_eq!(refused.status.code(), Some(2), "{refused:?}");
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("pipelines.done"), "{refused:?}");
+    assert_eq!(std::fs::read(&done).unwrap(), progress);
+    assert!(!journal.with_extension("trying").exists());
+    drop(held);
+    // A torn final progress record must not offset the next completed hash.
+    std::fs::write(&done, [progress.as_slice(), &[0xaa, 0xbb, 0xcc]].concat()).unwrap();
+    let resumed = run("made 0,", 0);
+    assert!(resumed.contains("1 done before"), "{resumed}");
+    assert_eq!(std::fs::read(&done).unwrap(), progress);
+    // A different binary key invalidates progress, even with a populated DXIL cache.
+    let mut stale = progress.clone();
+    stale[0] ^= 1;
+    std::fs::write(&done, stale).unwrap();
+    run("made 1,", 0);
+    assert_eq!(std::fs::read(&done).unwrap(), progress);
+    // An incomplete compute payload cannot be replayed and must remain retryable.
+    let mut broken = vec![b'C', 4, 0, 0];
+    le(&mut broken, 8);
+    broken.extend_from_slice(&(hash ^ 1).to_le_bytes());
+    broken.extend_from_slice(&shader_hash.to_le_bytes());
+    use std::io::Write;
+    std::fs::OpenOptions::new().append(true).open(&journal).unwrap().write_all(&broken).unwrap();
+    for _ in 0..2 {
+        let retried = run("made 0,", 1);
+        assert!(retried.contains("1 pipelines to make"), "{retried}");
+        assert!(retried.contains("not readable from the journal"), "{retried}");
+        assert_eq!(std::fs::read(&done).unwrap(), progress, "a failure must not enter completed progress");
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
 fn offline_compute_pipeline_is_reused_by_a_second_process() {
     use std::{fs, process::Command};
     let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
