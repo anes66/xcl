@@ -2186,6 +2186,47 @@ mod tests {
         }
     }
 
+    #[test]
+    fn title_bytes_nested_reads_keep_the_outer_snapshot_after_decommit() {
+        const CHILD: &str = "XCL_TEST_TITLE_BYTES_LIFETIME";
+        const TEST: &str = "hle::d3d12x::title_textures::tests::title_bytes_nested_reads_keep_the_outer_snapshot_after_decommit";
+        if std::env::var(CHILD).as_deref() != Ok("1") {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", TEST, "--nocapture", "--test-threads=1"])
+                .env(CHILD, "1").env("XCL_UMA_MB", "1").env("XCL_COHERENT_MB", "1").output().unwrap();
+            assert!(output.status.success(), "{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+            return;
+        }
+        use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_DECOMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE};
+        struct Source(usize);
+        impl Drop for Source {
+            fn drop(&mut self) { unsafe { VirtualFree(self.0 as *mut c_void, 0, MEM_RELEASE); } }
+        }
+        assert!(super::super::real::device_raw().is_null());
+        const LEN: usize = 3 * 4096 + 17;
+        unsafe {
+            let source = Source(VirtualAlloc(std::ptr::null(), LEN, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) as usize);
+            assert_ne!(source.0, 0);
+            std::ptr::write_bytes(source.0 as *mut u8, 0x6d, LEN);
+            let expected = content_hash(&vec![0x6d; LEN]);
+            with_title_bytes(source.0, LEN, |outer| {
+                assert_ne!(outer.as_ptr() as usize, source.0, "a readable plain range must be copied before invoking its consumer");
+                assert_eq!(content_hash(outer), expected);
+                std::ptr::write_bytes(source.0 as *mut u8, 0x31, LEN);
+                assert!(outer.iter().all(|&v| v == 0x6d), "source writes changed the snapshot");
+                assert_ne!(VirtualFree(source.0 as *mut c_void, LEN, MEM_DECOMMIT), 0);
+                // The outer TLS buffer is borrowed: a nested read must use its fallback.
+                with_title_bytes(source.0, LEN, |inner| {
+                    assert_ne!(inner.as_ptr(), outer.as_ptr());
+                    assert_eq!(inner.len(), LEN);
+                    assert!(inner.iter().all(|&v| v == 0));
+                });
+                assert_eq!(content_hash(outer), expected, "decommit or a nested read changed the snapshot");
+            });
+        }
+        assert!(super::super::real::device_raw().is_null());
+    }
+
     /// A guard or no-access page in the title's bytes reads as zeros, and the guard stays (a
     /// title's guard page is its own: reading must not use it up).
     #[test]
