@@ -182,3 +182,50 @@ fn every_program_translates_completely() {
         }
     }
 }
+
+#[test]
+fn generated_programs_validate_through_direct_dxil_without_a_gpu() {
+    const CHILD: &str = "XCL_TEST_DIRECT_GENERATED_MODE";
+    const TEST: &str = "generated_programs_validate_through_direct_dxil_without_a_gpu";
+    if std::env::var(CHILD).is_err() {
+        let mut switches = Vec::new();
+        for (mode, compact, nest) in [("plain", "0", "0"), ("flat", "1", "0"), ("nested", "1", "16")] {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", TEST, "--nocapture", "--test-threads=1"])
+                .env(CHILD, mode).env("XCL_DIRECT_COMPACT", compact).env("XCL_DIRECT_COMPACT_NEST", nest)
+                .env_remove("XCL_DXIL_NO_OPT").output().unwrap();
+            assert!(output.status.success(), "{mode}: {}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(stdout.contains(&format!("DIRECT_CPU mode={mode} validated=96;")), "child did not validate its matrix");
+            let shape = stdout.lines().find(|l| l.contains("DIRECT_SHAPE")).expect("child shape report");
+            switches.push(shape.split("switches=").nth(1).unwrap().parse::<usize>().unwrap());
+            for line in stdout.lines() {
+                if let Some(at) = line.find("DIRECT_") { println!("{}", &line[at..]); }
+            }
+        }
+        assert!(switches[2] > switches[1], "nested mode must add dispatch levels: {switches:?}");
+        return;
+    }
+    use xcl::gpu::dxil::{kernel::{translate_full, KernelOptions}, validate};
+    let mode = std::env::var(CHILD).unwrap();
+    let mut checked = 0;
+    for seed in [1, 2, 3, 5, 8, 13, 21, 34] {
+        for (if_depth, loops, loop_depth, lds_pct, mem_pct) in [(0, 0, 1, 0, 0), (3, 0, 1, 0, 0), (2, 2, 2, 5, 10), (4, 1, 2, 20, 40)] {
+            for (wave64, split) in [(false, false), (true, false), (true, true)] {
+                let knobs = Knobs { seed, ops: 300, if_depth, divergent_pct: 25, loops, loop_depth, wave64, lds_pct, mem_pct, ..Knobs::default() };
+                let code = program(&knobs);
+                let options = KernelOptions { wave64, split, mem_windows: 1, sampler_base: 0 };
+                let kernel = translate_full(&code, options).unwrap_or_else(|e| panic!("{knobs:?}, split={split}: {e}"));
+                validate::validate(&kernel.dxil).unwrap_or_else(|e| panic!("{knobs:?}, split={split}: {e}"));
+                if seed == 1 && if_depth == 3 && !wave64 {
+                    let dis = validate::disassemble(&kernel.dxil).expect("direct CPU disassembly");
+                    assert_eq!(dis.contains("xcl_blocks"), mode != "plain", "requested compact mode was not used");
+                    println!("DIRECT_SHAPE mode={mode} switches={}", dis.matches("switch i32").count());
+                }
+                checked += 1;
+            }
+        }
+    }
+    assert_eq!(checked, 96);
+    println!("DIRECT_CPU mode={mode} validated={checked}; no GPU execution");
+}
