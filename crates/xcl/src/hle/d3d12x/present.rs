@@ -768,6 +768,9 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, usize)>) {
         }
     }
     let n = PRESENTS.fetch_add(1, Ordering::Relaxed);
+    if super::pso_manifest::present_milestone(n + 1) {
+        super::pso_manifest::note(super::pso_manifest::Event::Present { n: n + 1 });
+    }
     if n == 0 {
         crate::xlog_info!("present: first game frame shown ({}x{})", desc.Width, desc.Height);
     }

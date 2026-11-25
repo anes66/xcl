@@ -106,6 +106,7 @@ impl Pending {
     fn note_use(&self) {
         if self.key != 0 && !self.used.swap(true, Ordering::Relaxed) {
             used::note(self.key);
+            super::pso_manifest::note(super::pso_manifest::Event::Use { key: self.key, compute: self.compute, ready: self.real.load(Ordering::Acquire) != 0 });
         }
     }
 }
