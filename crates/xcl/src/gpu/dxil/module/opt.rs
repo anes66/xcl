@@ -1609,7 +1609,10 @@ mod tests {
         // Verify `v = add(s, 1)` still reads `s` (NOT `a`).
         let Value::Inst(vi) = v else { unreachable!() };
         match m.insts[vi as usize].op {
-            Op::Bin(BinOp::Add, lhs, _, _) => assert_eq!(lhs, s, "latch add must keep guarded select `s` as operand"),
+            Op::Bin(BinOp::Add, lhs, rhs, _) => assert!(
+                (lhs == s && rhs == one) || (lhs == one && rhs == s),
+                "latch add must keep guarded select `s` and the increment",
+            ),
             ref other => panic!("unexpected op for latch add: {other:?}"),
         }
     }
