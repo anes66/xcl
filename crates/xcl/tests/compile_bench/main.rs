@@ -129,6 +129,18 @@ fn wave_size_picks_the_exec_instructions() {
 }
 
 #[test]
+#[should_panic(expected = "loop body exceeds SOPP branch range")]
+fn oversized_loop_branches_are_refused() {
+    program(&Knobs { ops: 100_000, loops: 1, if_depth: 0, lds_pct: 0, mem_pct: 0, ..Knobs::default() });
+}
+
+#[test]
+fn large_representable_loop_still_targets_its_body() {
+    let s = shape(&program(&Knobs { ops: 10_000, loops: 1, if_depth: 0, lds_pct: 0, mem_pct: 0, ..Knobs::default() }));
+    assert_eq!((s.ops, s.loops, s.loop_depth), (10_000, 1, 1));
+}
+
+#[test]
 fn lds_and_memory_shares_follow_the_knobs() {
     let at = |lds_pct, mem_pct| shape(&program(&Knobs { ops: 2000, lds_pct, mem_pct, ..Knobs::default() }));
     let s = at(0, 0);

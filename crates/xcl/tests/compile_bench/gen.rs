@@ -159,7 +159,8 @@ impl Gen<'_> {
         v.extend(inst("S_CMP_LG_U32", "ENC_SOPC", &[("SSRC0", counter), ("SSRC1", 128)], None));
         // the offset counts dwords from the instruction after the branch
         let back = -(((v.len() - head) / 4 + 1) as i64);
-        v.extend(inst("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", back as i16 as u16 as u64)], None));
+        let back = i16::try_from(back).expect("loop body exceeds SOPP branch range");
+        v.extend(inst("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", back as u16 as u64)], None));
         v
     }
 }
