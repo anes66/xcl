@@ -802,6 +802,103 @@ mod tests {
         }
     }
 
+    #[test]
+    fn copy_argument_forms_keep_reserved_sources_and_stack_dword_boundaries() {
+        use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualFree, MEM_RESERVE, MEM_RELEASE, PAGE_NOACCESS};
+        unsafe {
+            let reserved = VirtualAlloc(std::ptr::null(), 0x1_0000, MEM_RESERVE, PAGE_NOACCESS);
+            assert!(!reserved.is_null());
+            let source = reserved as usize;
+            for extra in [0, 1, 0xFFFF] {
+                for stale in [0, 0x16_0000_0000, 0xFFFF_FFFF_0000_0000] {
+                    let got = copy_args(stale | extra, source, 0xDEAD_BEEF_0000_0800, 0xABCD_EF01_0004_0000);
+                    assert_eq!(got, (reserved as *const u8, 0x800, 0x40000));
+                }
+            }
+            // The older form has no fourth stack argument: it must never consume that slot.
+            for unused in [0, usize::MAX, source] {
+                assert_eq!(copy_args(source, 0x800, 0x40000, unused), (reserved as *const u8, 0x800, 0x40000));
+            }
+            assert_ne!(VirtualFree(reserved, 0, MEM_RELEASE), 0);
+        }
+    }
+
+    #[test]
+    fn copy_argument_forms_preserve_pitched_mips_planes_arrays_and_volumes() {
+        type Six = unsafe extern "system" fn(*mut c_void, *mut u8, u32, u32, *const u8, u32, u32) -> HRESULT;
+        type Seven = unsafe extern "system" fn(*mut c_void, *mut u8, u32, u32, usize, *const u8, u32, u32) -> HRESULT;
+        let mut cases = Vec::new();
+        for layout in [1, 0x109] {
+            for format in [28, 71, 77, 118] {
+                cases.push(desc(65, 33, 3, 4, format, layout));
+            }
+        }
+        for layout in [1, 0x105] {
+            let mut d = desc(17, 9, 5, 4, 28, layout);
+            d[0..4].copy_from_slice(&4u32.to_le_bytes());
+            cases.push(d);
+        }
+        let mut checked = 0;
+        unsafe {
+            for (case, d) in cases.iter().enumerate() {
+                let mut c = std::ptr::null_mut();
+                assert_eq!(XGCreateTextureComputer(d.as_ptr(), &mut c), S_OK, "case {case}");
+                let t = Texture::new(d).unwrap();
+                let slot = |k: usize| *(*(c as *const *const usize)).add(k);
+                let six: [Six; 2] = [std::mem::transmute(slot(8)), std::mem::transmute(slot(9))];
+                let seven: [Seven; 2] = [std::mem::transmute(slot(8)), std::mem::transmute(slot(9))];
+                for plane in 0..t.planes.len() as u32 {
+                    let Some((s, at)) = t.plane_surface(plane) else { continue };
+                    for sub in 0..s.array as usize * s.chain.levels.len() {
+                        let mip = sub % s.chain.levels.len();
+                        let layer = sub / s.chain.levels.len();
+                        let m = s.chain.levels[mip];
+                        let row = m.width * s.bpe as usize;
+                        let pitch = row + 37;
+                        let slice_pitch = pitch * m.height + 53;
+                        let depth = if s.depth > 0 { m.depth } else { 1 };
+                        let mut linear = vec![0xCD; slice_pitch * depth + 128];
+                        let mut tiled = vec![0xCD; t.size() as usize + 128];
+                        // Build the reference per element, independently of the copy row loops.
+                        for z in 0..depth {
+                            for y in 0..m.height {
+                                for x in 0..m.width {
+                                    let a = z * slice_pitch + y * pitch + x * s.bpe as usize;
+                                    let b = at as usize + s.element_offset(mip, x, y, if s.depth > 0 { z } else { layer }) as usize;
+                                    for byte in 0..s.bpe as usize {
+                                        let value = (case * 31 + sub * 17 + x * 7 + y * 11 + z * 13 + byte) as u8;
+                                        linear[a + byte] = value;
+                                        tiled[b + byte] = value;
+                                    }
+                                }
+                            }
+                        }
+                        for newer in [false, true] {
+                            let invoke = |method: usize, dst: *mut u8, src: *const u8| {
+                                if newer {
+                                    seven[method](c, dst, plane, sub as u32, 0x16_0000_0000, src, pitch as u32, slice_pitch as u32)
+                                } else {
+                                    six[method](c, dst, plane, sub as u32, src, pitch as u32, slice_pitch as u32)
+                                }
+                            };
+                            let mut actual = vec![0xCD; tiled.len()];
+                            assert_eq!(invoke(0, actual.as_mut_ptr(), linear.as_ptr()), S_OK);
+                            assert_eq!(actual, tiled, "into case {case}, plane {plane}, sub {sub}, newer {newer}");
+                            // Copy from the independent tiled reference, not the output above.
+                            let mut actual = vec![0xCD; linear.len()];
+                            assert_eq!(invoke(1, actual.as_mut_ptr(), tiled.as_ptr()), S_OK);
+                            assert_eq!(actual, linear, "from case {case}, plane {plane}, sub {sub}, newer {newer}");
+                            checked += 2;
+                        }
+                    }
+                }
+                release(c);
+            }
+        }
+        assert_eq!(checked, 512);
+        eprintln!("XG copy matrix: {} descriptors, {checked} copies; CPU only", cases.len());
+    }
+
     /// As the console's library answers (seen on it): RGBA8 256×256, full chain, 64KB_S.
     #[test]
     fn rgba8_64kb_s_layout() {
