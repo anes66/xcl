@@ -1042,6 +1042,30 @@ mod shader_cache_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn single_latch_translation_does_not_reuse_pre_fix_disk_entries() {
+        use translated::{cached_in, identity_with, Backend};
+        let dir = std::env::temp_dir().join(format!("xcl-translated-latch-{}", std::process::id()));
+        let blob = b"synthetic-two-back-edges";
+        let version = crate::gpu::dxil::kernel::TRANSLATOR_VERSION;
+        for backend in [Backend::DirectCompute, Backend::DirectAll, Backend::Hlsl] {
+            let old = identity_with("same-source", "same-toolchain", backend, 7);
+            let current = identity_with("same-source", "same-toolchain", backend, version);
+            cached_in(&dir, old, blob, Stage::Compute, 0, 1, true, || Ok(compiled(1))).unwrap();
+            let mut calls = 0;
+            let result = cached_in(&dir, current, blob, Stage::Compute, 0, 1, true, || {
+                calls += 1;
+                Ok(compiled(2))
+            }).unwrap();
+            if backend == Backend::Hlsl {
+                assert_eq!((calls, result.dxil[0]), (0, 1), "HLSL entries remain reusable");
+            } else {
+                assert_eq!((calls, result.dxil[0]), (1, 2), "old direct DXIL must be rebuilt");
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     fn key(hash: u64) -> ShaderKey {
         ShaderKey {
             hash,
