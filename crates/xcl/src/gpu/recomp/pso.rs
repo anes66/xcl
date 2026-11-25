@@ -734,7 +734,7 @@ fn direct_compute(blob: &[u8], sampler_base: u32, windows: u32, split_wave64: bo
             }
         }
     }
-    let k = crate::gpu::dxil::kernel::translate_compute(code, o, &cs)?;
+    let k = crate::gpu::dxil::kernel::translate_compute_on(code, o, &cs, split_wave64)?;
     dump_direct(blob, &k.dxil);
     Ok(Compiled { dxil: k.dxil, samplers: k.static_samplers })
 }
