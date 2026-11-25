@@ -2351,6 +2351,67 @@ mod tests {
         }
     }
 
+    #[test]
+    fn failed_physical_page_io_keeps_plain_homes_reserved_without_a_gpu() {
+        const CHILD: &str = "XCL_TEST_PLAIN_PHYSICAL_IO";
+        const TEST: &str = "hle::kernelx::tests::failed_physical_page_io_keeps_plain_homes_reserved_without_a_gpu";
+        if std::env::var(CHILD).as_deref() != Ok("1") {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", TEST, "--nocapture", "--test-threads=1"])
+                .env(CHILD, "1").env("XCL_UMA_MB", "1").env("XCL_COHERENT_MB", "1").output().unwrap();
+            assert!(output.status.success(), "{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+            print!("{}", String::from_utf8_lossy(&output.stdout));
+            return;
+        }
+        assert!(crate::hle::d3d12x::real::device_raw().is_null(), "child must not initialize a GPU");
+        assert!(PHYS_BLOCKS.lock().unwrap().is_empty());
+        assert!(AWAY.lock().unwrap().is_none());
+        unsafe {
+            // Register reserved Windows memory as a plain home outside UMA's address windows.
+            let bytes = 3 * PHYS_PAGE;
+            let home = mem::VirtualAlloc(std::ptr::null(), bytes, mem::MEM_RESERVE, mem::PAGE_READWRITE) as usize;
+            assert_ne!(home, 0);
+            assert!(crate::gpu::uma::get().is_none_or(|u| !u.contains(home) && !u.is_sparse(home)));
+            let first = NEXT_PAGE_INDEX.fetch_add(3, Ordering::Relaxed);
+            PHYS_BLOCKS.lock().unwrap().insert(first, (3, 3, home));
+            let valid = [page_number(first), page_number(first + 1), page_number(first + 2)];
+            let mut rejected = 0;
+            for bad in [0, 1, page_number(first + 3)] {
+                for at in 0..3 {
+                    let mut pages = valid;
+                    pages[at] = bad;
+                    for offset in [0, PHYS_PAGE - 1] {
+                        let mut dst = vec![0xa5; bytes - offset];
+                        let src = vec![0x3c; bytes - offset];
+                        assert!(!write_physical_pages(&pages, offset, &src));
+                        for i in 0..3 { assert!(!committed_page(home + i * PHYS_PAGE), "failed write committed page {i}"); }
+                        assert!(!read_physical_pages(&pages, offset, &mut dst));
+                        assert!(dst.iter().all(|&v| v == 0xa5), "failed read changed its destination");
+                        for i in 0..3 { assert!(!committed_page(home + i * PHYS_PAGE), "failed read committed page {i}"); }
+                        rejected += 2;
+                    }
+                }
+            }
+            assert_eq!(rejected, 36);
+            let mut with_unused_invalid = valid.to_vec();
+            with_unused_invalid.push(0);
+            let mut dst = vec![0xa5; bytes];
+            assert!(read_physical_pages(&with_unused_invalid, 0, &mut dst));
+            assert!(dst.iter().all(|&v| v == 0), "newly committed pages must read as zero");
+            for offset in [0, PHYS_PAGE - 1] {
+                let src: Vec<u8> = (0..bytes - offset).map(|i| (i.wrapping_mul(37) + 11) as u8).collect();
+                let mut readback = vec![0; src.len()];
+                assert!(write_physical_pages(&with_unused_invalid, offset, &src));
+                assert!(read_physical_pages(&with_unused_invalid, offset, &mut readback));
+                assert_eq!(readback, src);
+            }
+            assert_eq!(PHYS_BLOCKS.lock().unwrap().remove(&first), Some((3, 3, home)));
+            assert_ne!(mem::VirtualFree(home as *mut c_void, 0, mem::MEM_RELEASE), 0);
+            assert!(crate::hle::d3d12x::real::device_raw().is_null());
+            println!("36 invalid I/O requests left plain homes reserved; valid three-page reads/writes matched without a GPU");
+        }
+    }
+
     /// Pages mapped, half of them written, then all mapped again in one call – at another
     /// address or the same one: the written ones keep their contents. The first pages of the
     /// call are never-used (nothing to move), the ones after them are moved: what a run of
