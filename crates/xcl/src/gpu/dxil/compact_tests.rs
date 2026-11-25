@@ -127,6 +127,121 @@ fn branches_to_many_places_keep_their_target_in_the_entry() {
     assert!(p.words() < 500, "{} words", p.words());
 }
 
+fn compact_table_words(bc: &[u8], name: &str) -> Option<Vec<u32>> {
+    let root = super::bitreader_tests::parse(bc);
+    let module = root.find(8).unwrap();
+    let globals = module.records_with(7);
+    let functions = module.records_with(8);
+    let symbols = module.find(14).unwrap();
+    let symbol = symbols.records_with(1).into_iter().find(|r| r[1..].iter().copied().eq(name.bytes().map(u64::from)))?;
+    let initializer = globals[symbol[0] as usize][2] as usize - 1;
+    let base = globals.len() + functions.len();
+    let constants: Vec<_> = module.find(11).unwrap().records.iter().filter(|r| r.0 != 1).collect();
+    let aggregate = constants[initializer - base];
+    assert_eq!(aggregate.0, 7, "table initializer must be an aggregate");
+    Some(aggregate.1.iter().map(|&id| {
+        let integer = constants[id as usize - base];
+        assert_eq!(integer.0, 4, "table elements must be integers");
+        let encoded = integer.1[0];
+        let magnitude = (encoded >> 1) as i64;
+        (if encoded & 1 == 0 { magnitude } else { -magnitude }) as u32
+    }).collect())
+}
+
+#[test]
+fn compact_packed_tables_preserve_every_class_and_successor() {
+    use super::cfg::Term;
+    use super::module::Block;
+    let mut checked = 0usize;
+    let mut crossed = 0usize;
+    for copies in [1, 2, 3, 7, 8, 15, 16, 31, 32, 63, 64, 127, 128, 255, 256, 511, 512, 1000] {
+        for with_loop in [false, true] {
+            let code = if with_loop { repeated(copies) } else { early_outs(copies) };
+            for inline in [false, true] {
+                let cfg = super::cfg::Cfg::build(&code).unwrap();
+                let leaders = cfg.blocks.iter().filter_map(|b| b.insts.first().map(|&i| cfg.insts[i].pc)).collect();
+                let o = KernelOptions { wave64: true, split: true, mem_windows: 1, sampler_base: 0 };
+                let mut lw = super::lower::Lw::new(&cfg.insts, &leaders, o, &super::kernel::Entry::Kernel);
+                lw.setup_lanes();
+                let lane = lw.lane;
+                let stride = lw.c((crate::gpu::recomp::KERNEL_VGPRS * 4) as u32);
+                let base = lw.mul(lane, stride);
+                lw.init.vgpr_base = Some(lw.addc(base, (crate::gpu::recomp::KERNEL_SGPRS * 4) as u32));
+                let mut p = super::compact::plan(&cfg, &lw).unwrap();
+                let index = |b: usize| p.order.iter().position(|&x| x == b).unwrap() as u32;
+                for (n, &b) in p.order.iter().enumerate() {
+                    if let Term::Cond(_, _, f) = cfg.blocks[b].term {
+                        assert_eq!(index(f), n as u32 + 1, "fixture must support inline targets");
+                    }
+                }
+                // Exercise both encodings on the same CFG, including backward offsets.
+                p.inline = inline;
+                let width = |n: usize| (1..=32).find(|&b| (n.saturating_sub(1) as u64) < (1u64 << b)).unwrap();
+                let cb = width(p.rep.len());
+                let pb = width(if inline { p.order.len() } else { p.steps.len() });
+                let bits = cb + pb;
+                let head = lw.block(None);
+                let exit = lw.block(None);
+                lw.edge(Block(0), head);
+                super::compact::emit(&mut lw, &cfg, &p, head, exit).unwrap();
+                lw.s.m.set_block(exit);
+                lw.seal(exit);
+                lw.s.m.ret();
+                lw.s.m.set_block(Block(0));
+                lw.s.m.br(head);
+                let bc = lw.s.m.to_bitcode("dxil-ms-dx", "");
+                let packed = compact_table_words(&bc, "xcl_blocks").unwrap();
+                let steps = compact_table_words(&bc, "xcl_steps");
+                assert_eq!(steps.is_none(), inline);
+                assert_eq!(packed.len() + steps.as_ref().map_or(0, Vec::len), p.words());
+                assert_eq!(*packed.last().unwrap(), 0, "the extra read word must be zero");
+                for (n, &b) in p.order.iter().enumerate() {
+                    // Decode one bit at a time, independently of the emitter's cross-word shifts.
+                    let mut entry = 0u64;
+                    for bit in 0..bits as usize {
+                        let at = n * bits as usize + bit;
+                        entry |= (((packed[at / 32] >> (at % 32)) & 1) as u64) << bit;
+                    }
+                    crossed += usize::from(n * bits as usize % 32 + bits as usize > 32);
+                    checked += 1;
+                    let class = (entry & ((1u64 << cb) - 1)) as u32;
+                    let field = (entry >> cb) as u32;
+                    assert_eq!(class, p.class[n], "copies={copies}, loop={with_loop}, inline={inline}, block={n}");
+                    let successors = if let Some(steps) = &steps {
+                        ((n as u32).wrapping_add(steps[field as usize * 2]),
+                            (n as u32).wrapping_add(steps[field as usize * 2 + 1]))
+                    } else { (field, n as u32 + 1) };
+                    let index = |target| p.order.iter().position(|&x| x == target).unwrap() as u32;
+                    match cfg.blocks[b].term {
+                        Term::Jump(t) => assert_eq!(successors.0, index(t)),
+                        Term::Cond(_, t, f) => assert_eq!(successors, (index(t), index(f))),
+                        Term::End if inline => assert_eq!(field, 0),
+                        Term::End => assert_eq!(successors, (n as u32, n as u32)),
+                    }
+                }
+            }
+        }
+    }
+    assert!(checked > 10_000 && crossed > 1_000, "checked={checked}, crossed={crossed}");
+    println!("packed table entries checked: {checked}; cross-word entries: {crossed}");
+}
+
+#[test]
+fn compact_inline_targets_require_the_actual_conditional_fallthrough() {
+    use super::cfg::Term;
+    let mut cfg = super::cfg::Cfg::build(&early_outs(64)).unwrap();
+    let leaders = cfg.blocks.iter().filter_map(|b| b.insts.first().map(|&i| cfg.insts[i].pc)).collect();
+    let o = KernelOptions { wave64: true, split: true, mem_windows: 1, sampler_base: 0 };
+    let lw = super::lower::Lw::new(&cfg.insts, &leaders, o, &super::kernel::Entry::Kernel);
+    assert!(super::compact::plan(&cfg, &lw).unwrap().inline);
+    let Term::Cond(_, t, f) = &mut cfg.blocks[0].term else { panic!("conditional fixture") };
+    std::mem::swap(t, f);
+    let p = super::compact::plan(&cfg, &lw).unwrap();
+    assert!(!p.inline, "a conditional false edge cannot be replaced by the next block");
+    let Term::Cond(_, t, f) = cfg.blocks[0].term else { unreachable!() };
+    assert_eq!(p.next[0], (t as u32, f as u32));
+}
+
 #[test]
 fn gpu_compact_form_with_targets_in_the_entry_runs_as_the_plain_form() {
     match (runner::adapter(), runner::wave64_programs_supported(), crate::gpu::recomp::dxc::location()) {
