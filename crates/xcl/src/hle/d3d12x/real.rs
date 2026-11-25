@@ -4043,7 +4043,7 @@ fn pso_trace() -> bool {
 /// `driver_compile`, with the console record's hash (`fnv64` of the shader container, as in
 /// `[SHADER]` lines and `xcl shaders --measure-pso`) and whether a driver blob was supplied.
 /// Also returns the time spent in the driver alone (not waiting for a slot).
-fn driver_compile_identified<R>(kind: &str, bytes: usize, gate: bool, record: Option<(u64, bool)>, build: impl FnOnce() -> R) -> (R, std::time::Duration) {
+fn driver_compile_identified<R>(kind: &str, bytes: usize, gate: bool, record: Option<(u64, bool, Option<&std::path::Path>)>, build: impl FnOnce() -> R) -> (R, std::time::Duration) {
     let huge = gate && bytes >= huge_pso_bytes() && std::thread::current().name().is_some_and(|n| n.starts_with("xcl-pso"));
     let waited = std::time::Instant::now();
     let _slot = huge.then(|| big_compile_turn(compile_slots(bytes), || big_compile_commit_free(big_compile_headroom(bytes)), super::pso_async::build_is_wanted));
@@ -4052,8 +4052,9 @@ fn driver_compile_identified<R>(kind: &str, bytes: usize, gate: bool, record: Op
     let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed) + 1;
     let log = pso_trace() || bytes >= huge_pso_bytes();
     if log {
-        let record = record.map_or_else(String::new, |(hash, cached)| {
-            format!(", record {hash:016x}, driver blob {}", if cached { "supplied" } else { "absent" })
+        let record = record.map_or_else(String::new, |(hash, cached, path)| {
+            let key = if pso_trace() { cache_trace_key(path) } else { String::new() };
+            format!(", record {hash:016x}, driver blob {}{key}", if cached { "supplied" } else { "absent" })
         });
         crate::xlog_info!("D3D12.X: driver compile start #{sequence}: {kind} PSO, {bytes} B DXIL{record}");
     }
@@ -4064,6 +4065,11 @@ fn driver_compile_identified<R>(kind: &str, bytes: usize, gate: bool, record: Op
         crate::xlog_info!("D3D12.X: driver compile finish #{sequence}: {kind} PSO, {bytes} B DXIL, {} ms{}", took.as_millis(), gate_note(bytes >= huge_pso_bytes(), huge, waited));
     }
     (r, took)
+}
+
+fn cache_trace_key(path: Option<&std::path::Path>) -> String {
+    let name = path.and_then(|p| p.file_name()).and_then(|s| s.to_str()).unwrap_or("unavailable");
+    format!(", cache file {name}")
 }
 
 /// How a logged driver compile went through the huge-pipeline gate.
@@ -4124,6 +4130,16 @@ mod big_compile_tests {
     use super::*;
     use std::sync::atomic::AtomicBool;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn cache_trace_names_the_disk_key_without_its_directory() {
+        for name in ["0123456789abcdef-100-0.pso", "0123456789abcdef-100-1.chain.pso", "gfx-0123456789abcdef-100.pso"] {
+            let path = std::path::Path::new("private title folder").join(name);
+            assert_eq!(cache_trace_key(Some(&path)), format!(", cache file {name}"));
+        }
+        assert_eq!(cache_trace_key(None), ", cache file unavailable");
+        assert_eq!(cache_trace_key(Some(std::path::Path::new("/"))), ", cache file unavailable");
+    }
 
     #[test]
     fn wanted_builds_bypass_commit_and_unwanted_slot_but_respect_hard_cap() {
@@ -4421,7 +4437,7 @@ unsafe fn compute_container(this: *mut c_void, f: PsoFn, d: &D3D12_COMPUTE_PIPEL
         "compute",
         dxil.len(),
         gate_compute_driver_compile(cached.is_some()),
-        Some((record, cached.is_some())),
+        Some((record, cached.is_some(), disk.as_deref())),
         || finish_pso(this, f, &copy as *const _ as *const c_void, riid, ppv),
     );
     if hr < 0 && cached.is_some() {
@@ -4435,7 +4451,7 @@ unsafe fn compute_container(this: *mut c_void, f: PsoFn, d: &D3D12_COMPUTE_PIPEL
             "compute retry",
             dxil.len(),
             gate_compute_driver_compile(false),
-            Some((record, false)),
+            Some((record, false, disk.as_deref())),
             || finish_pso(this, f, &copy as *const _ as *const c_void, riid, ppv),
         );
         hr = retried;
@@ -5201,7 +5217,7 @@ unsafe fn translated_graphics_pso_once(this: *mut c_void, f: PsoFn, desc: *const
                 driver_cache::note(false, disk.as_deref());
             }
         },
-        |label, has_cached, f| driver_compile_identified(label, bytes, gate_compute_driver_compile(has_cached), Some((ps_hash, has_cached)), f),
+        |label, has_cached, f| driver_compile_identified(label, bytes, gate_compute_driver_compile(has_cached), Some((ps_hash, has_cached, disk.as_deref())), f),
         |c| finish_pso(this, f, c as *const _ as *const c_void, riid, ppv),
     );
     let hr = build.hr;
