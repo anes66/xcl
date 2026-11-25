@@ -1083,6 +1083,68 @@ mod tests {
         assert_eq!(pool.free_total, 8, "OOM rollback must return all popped tiles");
     }
 
+    #[test]
+    fn tile_pool_oom_preserves_tile_ownership_across_growth_and_cooling() {
+        use std::collections::BTreeSet;
+        let t0 = Instant::now();
+        let mut cases = 0;
+        for pages in [1u32, 2, 7, 64, 1024] {
+            for age in [COOL - Duration::from_nanos(1), COOL, COOL + Duration::from_nanos(1)] {
+                for grow in [0u32, 1, 3] {
+                    for preferred in [None, Some(0), Some(2), Some(99)] {
+                        let mut pool = TilePool::new();
+                        for h in 0..3 { assert_eq!(pool.add_heap(pages), h); }
+                        let held = pool.take_batch(pages as usize * 3 / 2, Some(1), t0, pages,
+                            || panic!("initial pools have enough tiles")).unwrap();
+                        let mut live = BTreeSet::new();
+                        let mut cooling = BTreeSet::new();
+                        for (i, &tile) in held.iter().enumerate() {
+                            if i % 2 == 0 {
+                                pool.push_cooling(tile, t0);
+                                cooling.insert(tile);
+                            } else {
+                                live.insert(tile);
+                            }
+                        }
+                        let all: BTreeSet<_> = (0..3 + grow).flat_map(|h| (0..pages).map(move |t| (h, t))).collect();
+                        let unavailable: BTreeSet<_> = live.iter().copied().chain(
+                            cooling.iter().copied().filter(|_| age < COOL)).collect();
+                        let expected: BTreeSet<_> = all.difference(&unavailable).copied().collect();
+                        let mut made = 0;
+                        let failed = pool.take_batch(expected.len() + 1, preferred, t0 + age, pages, || {
+                            if made == grow { return None; }
+                            let h = 3 + made;
+                            made += 1;
+                            Some(h)
+                        });
+                        assert!(failed.is_none(), "synthetic heap allocation should fail");
+                        assert_eq!(made, grow);
+                        assert_eq!(pool.free_by_heap.len(), (3 + grow) as usize);
+                        let free: Vec<_> = pool.free_by_heap.iter().enumerate()
+                            .flat_map(|(h, tiles)| tiles.iter().map(move |&t| (h as u32, t))).collect();
+                        let unique: BTreeSet<_> = free.iter().copied().collect();
+                        assert_eq!(free.len(), unique.len(), "rollback duplicated a free tile");
+                        assert_eq!(unique, expected, "rollback lost a tile or freed a live/cooling tile");
+                        assert_eq!(pool.free_total, expected.len());
+                        let waiting: BTreeSet<_> = pool.cooling.iter().map(|&(tile, _)| tile).collect();
+                        assert_eq!(pool.cooling.len(), waiting.len());
+                        assert_eq!(waiting, if age < COOL { cooling } else { BTreeSet::new() });
+
+                        // A retry consumes every returned tile without requesting another heap.
+                        let retry = pool.take_batch(expected.len(), preferred, t0 + age, pages,
+                            || panic!("rollback left reusable tiles")).unwrap();
+                        assert_eq!(retry.len(), expected.len());
+                        assert_eq!(retry.into_iter().collect::<BTreeSet<_>>(), expected);
+                        assert_eq!(pool.free_total, 0);
+                        assert!(pool.free_by_heap.iter().all(Vec::is_empty));
+                        cases += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(cases, 180);
+    }
+
     /// Idle pages go back after `IDLE`, and a sweep looks at the queue of idle pages alone: one
     /// used again stays, one idle again later goes when that is `IDLE` ago, and the sweeps of
     /// 20 000 placements beside 200 000 pages in use take no time to speak of (a look at every
