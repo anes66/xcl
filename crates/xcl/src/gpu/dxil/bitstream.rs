@@ -232,4 +232,69 @@ mod tests {
         b.end_block();
         assert_eq!(a.finish(), b.finish());
     }
+
+    #[test]
+    fn fixed_and_vbr_boundaries_match_independent_bits() {
+        fn bits(out: &mut Vec<u8>, value: u64, width: u32) {
+            out.extend((0..width).map(|i| ((value >> i) & 1) as u8));
+        }
+        fn align(out: &mut Vec<u8>) { out.resize(out.len().div_ceil(32) * 32, 0); }
+        let mut cases = 0;
+        for lead in 0..32 {
+            for width in 0..=32 {
+                let mask = (1u64 << width) - 1;
+                for (pattern, value) in [0, mask, 0xaaaaaaaa & mask, 0x55555555 & mask].into_iter().enumerate() {
+                    let mut writer = BitWriter::with_capacity(lead as usize);
+                    let mut reference = Vec::new();
+                    let prefix = 0x9e3779b9 & ((1u64 << lead) - 1);
+                    writer.emit(prefix, lead);
+                    bits(&mut reference, prefix, lead);
+                    writer.emit(value, width);
+                    bits(&mut reference, value, width);
+                    let vbr_width = width % 31 + 2;
+                    let payload = vbr_width - 1;
+                    let hi = 1u64 << payload;
+                    for (i, value) in [0, hi - 1, hi, hi + 1, u32::MAX as u64, u64::MAX].into_iter().enumerate() {
+                        writer.vbr(value, vbr_width);
+                        // Derive the chunk count from the value's significant bits.
+                        let chunks = (64 - value.leading_zeros()).max(1).div_ceil(payload);
+                        for chunk in 0..chunks {
+                            let part = (value >> (chunk * payload)) & (hi - 1);
+                            bits(&mut reference, part | if chunk + 1 < chunks { hi } else { 0 }, vbr_width);
+                        }
+                        if (i + pattern) % 3 == 0 {
+                            writer.align32();
+                            align(&mut reference);
+                        }
+                    }
+                    align(&mut reference);
+                    let expected: Vec<_> = reference.chunks_exact(8)
+                        .map(|byte| byte.iter().enumerate().fold(0u8, |n, (i, bit)| n | (bit << i))).collect();
+                    assert_eq!(writer.finish(), expected, "lead {lead}, width {width}, pattern {pattern}");
+                    cases += 1;
+                }
+            }
+        }
+        assert_eq!(cases, 4224);
+    }
+
+    #[test]
+    fn string_records_match_operand_records_across_lengths_and_nesting() {
+        for depth in 1..=4 {
+            for text in ["", "dx.op.rawBufferLoad.i32", "a\0b", "čćžšđ / 漢字 / 🦀"] {
+                for repeat in [1, 31, 32, 127] {
+                    let text = text.repeat(repeat);
+                    let prefix = [0, 31, 32, u64::MAX];
+                    let mut direct = BitWriter::with_capacity(1);
+                    let mut reference = BitWriter::new();
+                    for id in 0..depth { direct.enter_block(id); reference.enter_block(id); }
+                    direct.record_str(63, &prefix, &text);
+                    let operands: Vec<_> = prefix.into_iter().chain(text.bytes().map(u64::from)).collect();
+                    reference.record(63, &operands);
+                    for _ in 0..depth { direct.end_block(); reference.end_block(); }
+                    assert_eq!(direct.finish(), reference.finish(), "depth {depth}, repeat {repeat}, {} UTF-8 bytes", text.len());
+                }
+            }
+        }
+    }
 }
