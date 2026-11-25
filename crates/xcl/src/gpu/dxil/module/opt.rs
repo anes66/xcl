@@ -1219,6 +1219,73 @@ mod tests {
     }
 
     #[test]
+    fn window_high_folding_preserves_overflow_and_low_bit_boundaries() {
+        fn evaluate(m: &Module, v: Value, inputs: [(Value, u64); 2]) -> u64 {
+            if let Some((_, n)) = inputs.iter().find(|(input, _)| *input == v) { return *n; }
+            if let Some(n) = m.const_u64(v) { return n; }
+            let Value::Inst(i) = v else { panic!("unexpected value {v:?}") };
+            let width = m.int_width(m.insts[i as usize].ty).unwrap();
+            let mask = (1u128 << width) - 1;
+            let eval = |v| evaluate(m, v, inputs) as u128;
+            let result = match m.insts[i as usize].op {
+                Op::Cast(CastOp::ZExt, x, _) => eval(x),
+                Op::Bin(BinOp::Or, a, b, _) => eval(a) | eval(b),
+                Op::Bin(BinOp::Shl, a, b, _) => eval(a) << eval(b),
+                Op::Bin(BinOp::LShr, a, b, _) => eval(a) >> eval(b),
+                ref op => panic!("unexpected window operation {op:?}"),
+            };
+            (result & mask) as u64
+        }
+
+        let mut checked = 0;
+        for width in [16, 32, 64] {
+            for source_width in [1, 8, 16, 32].into_iter().filter(|&w| w < width) {
+                for shift in 1..width {
+                    for reverse in [false, true] {
+                        let mut m = Module::new();
+                        m.define_entry("main");
+                        let source = m.int(source_width);
+                        let word = m.int(width);
+                        let void = m.void();
+                        let input_ty = m.func_ty(source, &[]);
+                        let input = m.declare("cpu.window.input", input_ty, FnAttrs::None);
+                        let sink_ty = m.func_ty(void, &[word]);
+                        let sink = m.declare("cpu.window.sink", sink_ty, FnAttrs::None);
+                        let lo = m.call(input, &[]);
+                        let hi = m.call(input, &[]);
+                        let low = m.cast(CastOp::ZExt, lo, word);
+                        let high = m.cast(CastOp::ZExt, hi, word);
+                        let amount = m.const_int(word, shift as u64);
+                        let shifted = m.bin(BinOp::Shl, high, amount);
+                        let packed = if reverse { m.bin(BinOp::Or, shifted, low) } else { m.bin(BinOp::Or, low, shifted) };
+                        let result = m.bin(BinOp::LShr, packed, amount);
+                        m.call(sink, &[result]);
+                        m.ret();
+                        m.optimize();
+                        let got = m.blocks.iter().flatten().find_map(|&i| match &m.insts[i as usize].op {
+                            Op::Call(f, args) if *f == sink => Some(args[0]),
+                            _ => None,
+                        }).unwrap();
+                        if shift >= source_width && source_width + shift <= width {
+                            assert_eq!(got, high, "valid window-high pattern must still fold");
+                        }
+                        let source_mask = (1u64 << source_width) - 1;
+                        let values = [0, 1, 1u64 << (source_width - 1), source_mask, 0x96a5_5a69 & source_mask];
+                        let word_mask = (1u128 << width) - 1;
+                        for x in values { for y in values {
+                            let expected = (((x as u128 | ((y as u128) << shift)) & word_mask) >> shift) as u64;
+                            assert_eq!(evaluate(&m, got, [(lo, x), (hi, y)]), expected,
+                                "i{source_width}->i{width}, shift={shift}, reverse={reverse}, lo={x:#x}, hi={y:#x}");
+                            checked += 1;
+                        } }
+                    }
+                }
+            }
+        }
+        println!("window-high outputs checked: {checked}");
+    }
+
+    #[test]
     fn integer_cast_folding_matches_cpu_sign_extension() {
         let mut checked = 0;
         for source_width in [1, 8, 16, 32, 64] {
