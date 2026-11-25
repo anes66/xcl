@@ -68,9 +68,9 @@ pub fn plan(cfg: &Cfg, lw: &Lw) -> Option<Plan> {
             key.push(d.words.len() as u64);
             key.extend(d.words.iter().map(|&w| w as u64));
             key.push(d.literal.map_or(u64::MAX, |l| l as u64));
-            if let Some(s) = lw.static_samplers.get(&d.pc) {
-                key.extend(s.iter().map(|&w| w as u64));
-            }
+            let sampler = lw.static_samplers.get(&d.pc);
+            key.push(sampler.is_some() as u64);
+            key.extend(sampler.into_iter().flatten().map(|&w| w as u64));
             // what `Lw::write_mask` asks of this address, for any register a mask can go to
             if let Some(&l) = lw.whole_live.get(&d.pc) {
                 let sdwa = ext_encoding(d).and_then(|e| crate::gpu::rdna2::field_value(e, &d.words, "SDST"));
