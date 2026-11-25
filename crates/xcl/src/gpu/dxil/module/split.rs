@@ -1113,7 +1113,21 @@ mod tests {
             .expect("split the synthetic program");
         assert!(chain.pieces.len() >= 3);
         if !split && extra_adds == 0 {
-            assert_eq!(chain.dwords_per_group, 256, "exercise actual Wave32 payload reuse");
+            let plan = lw.s.m.dispatch_plan(40).unwrap();
+            let payload: std::collections::BTreeSet<_> = plan.edges.iter().flat_map(|e| e.live.iter().copied()).collect();
+            let fixed_words = 1 + payload.iter().map(|&v| lw.s.m.transport_words(v).unwrap()).sum::<u32>();
+            let stage = |block| plan.blocks.iter().position(|blocks| blocks.contains(&block)).unwrap();
+            let spans: Vec<_> = payload.iter().map(|&v| {
+                let super::Value::Inst(i) = v else { unreachable!() };
+                let first = stage(lw.s.m.def_block[i as usize]);
+                let last = plan.edges.iter().filter(|e| e.live.contains(&v)).map(|e| stage(e.to)).max().unwrap();
+                (first, last, lw.s.m.transport_words(v).unwrap())
+            }).collect();
+            let peak = (0..plan.blocks.len()).map(|s| spans.iter()
+                .filter(|&&(first, last, _)| first <= s && s <= last).map(|&(_, _, words)| words).sum::<u32>()).max().unwrap();
+            println!("scratch comparison: fixed={} compact={} peak={} pieces={}", fixed_words * threads, chain.dwords_per_group, (peak + 1) * threads, chain.pieces.len());
+            assert_eq!(chain.dwords_per_group, (peak + 1) * threads, "fixture must attain its peak-live-word lower bound");
+            assert!(chain.dwords_per_group < fixed_words * threads, "exercise actual Wave32 payload reuse");
         }
         if !run_gpu {
             return;
