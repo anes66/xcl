@@ -2768,4 +2768,49 @@ mod tests {
         }
         let _ = std::fs::remove_file(&tmp);
     }
+
+    #[test]
+    fn file_bounds_precede_allocator_refusal_and_refusal_preserves_destination() {
+        const CHILD: &str = "XCL_TEST_DSTORAGE_FILE_OOM";
+        const TEST: &str = "hle::dstorage::tests::file_bounds_precede_allocator_refusal_and_refusal_preserves_destination";
+        const SIZE: u32 = 128 << 20;
+        if let Some(path) = std::env::var_os(CHILD) {
+            use windows_sys::Win32::System::JobObjects::*;
+            let file = FileInner { id: 1, path: Vec::new(), file: Mutex::new(Some(Arc::new(std::fs::File::open(path).unwrap()))) };
+            let mut dst = [0xa5u8; 8];
+            let r = Request { options: 1 << BCPACK_SHIFT, destination: dst.as_mut_ptr() as u64,
+                destination_size: dst.len() as u32, source: 1, source_size: SIZE, ..Default::default() };
+            assert_eq!(r.check(false), Ok(()));
+            assert!(crate::hle::d3d12x::real::device_raw().is_null());
+            unsafe {
+                let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+                assert!(!job.is_null());
+                let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+                info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_PROCESS_MEMORY;
+                info.ProcessMemoryLimit = 64 << 20;
+                assert_ne!(SetInformationJobObject(job, JobObjectExtendedLimitInformation,
+                    &info as *const _ as *const _, std::mem::size_of_val(&info) as u32), 0);
+                assert_ne!(AssignProcessToJobObject(job, GetCurrentProcess()), 0);
+                let past_end = Request { offset: 1, ..r };
+                assert_eq!(execute(&past_end, Some(&file), None, None), Err(E_END_OF_FILE), "file bounds must be checked before the oversized source allocation");
+                assert_eq!(dst, [0xa5; 8]);
+                assert_eq!(execute(&r, Some(&file), None, None), Err(E_OUTOFMEMORY), "a valid source range must report allocator refusal");
+                assert_eq!(dst, [0xa5; 8], "failed execution wrote destination bytes");
+                assert_ne!(CloseHandle(job), 0);
+            }
+            assert!(crate::hle::d3d12x::real::device_raw().is_null());
+            return;
+        }
+        let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let root = std::env::temp_dir().join(format!("xcl-dstorage-file-oom-{}-{nonce}", std::process::id()));
+        std::fs::create_dir(&root).unwrap();
+        let path = root.join("synthetic.bin");
+        // Only set the file's length; execution must refuse before reading its contents.
+        std::fs::File::create(&path).unwrap().set_len(SIZE as u64).unwrap();
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", TEST, "--nocapture", "--test-threads=1"]).env(CHILD, &path).output().unwrap();
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_dir(root).unwrap();
+        assert!(out.status.success(), "{}\n{}\n{}", out.status, String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    }
 }
