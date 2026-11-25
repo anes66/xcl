@@ -2253,4 +2253,111 @@ mod tests {
             other => panic!("unexpected op for FAbs: {other:?}"),
         }
     }
+
+    #[test]
+    fn guarded_quad_outputs_match_a_cpu_model_for_every_lane_mask() {
+        fn evaluate(m: &Module, mask: u32, x: [f32; 4], y: [f32; 4]) -> Vec<[u32; 4]> {
+            let mut values = vec![[0u32; 4]; m.insts.len()];
+            let mut outputs = Vec::new();
+            for &i in &m.blocks[0] {
+                let read = |v: Value| match v {
+                    Value::Inst(j) => values[j as usize],
+                    Value::Const(c) => [match m.consts[c as usize] {
+                        super::super::ConstDef::Int(_, n) => n as u32,
+                        super::super::ConstDef::Float(_, n) => n as u32,
+                        ref c => panic!("unexpected constant {c:?}"),
+                    }; 4],
+                    _ => panic!("unexpected value {v:?}"),
+                };
+                values[i as usize] = match &m.insts[i as usize].op {
+                    Op::Cmp(Pred::Ne, a, b) => {
+                        let (a, b) = (read(*a), read(*b));
+                        std::array::from_fn(|lane| u32::from(a[lane] != b[lane]))
+                    }
+                    Op::Select(c, t, f) => {
+                        let (c, t, f) = (read(*c), read(*t), read(*f));
+                        std::array::from_fn(|lane| if c[lane] != 0 { t[lane] } else { f[lane] })
+                    }
+                    Op::Call(f, args) => match m.funcs[*f as usize].name.as_str() {
+                        "cpu.mask" => std::array::from_fn(|lane| (mask >> lane) & 1),
+                        "cpu.x" => x.map(f32::to_bits),
+                        "cpu.y" => y.map(f32::to_bits),
+                        "cpu.sink" => { outputs.push(read(args[0])); [0; 4] }
+                        "dx.op.unary.f32" => {
+                            let opcode = read(args[0])[0];
+                            let q = read(args[1]).map(f32::from_bits);
+                            std::array::from_fn(|lane| match opcode {
+                                6 => q[lane].abs().to_bits(),
+                                83 => (q[1] - q[0]).to_bits(),
+                                84 => (q[2] - q[0]).to_bits(),
+                                85 => (q[(lane & 2) + 1] - q[lane & 2]).to_bits(),
+                                86 => (q[(lane & 1) + 2] - q[lane & 1]).to_bits(),
+                                _ => panic!("unexpected opcode {opcode}"),
+                            })
+                        }
+                        other => panic!("unexpected call {other}"),
+                    },
+                    Op::Ret => [0; 4],
+                    other => panic!("unexpected CPU fixture operation {other:?}"),
+                };
+            }
+            outputs
+        }
+
+        let mut m = Module::new();
+        m.define_entry("main");
+        let i32t = m.i32();
+        let f32t = m.f32();
+        let void = m.void();
+        let mask_ty = m.func_ty(i32t, &[]);
+        let mask_fn = m.declare("cpu.mask", mask_ty, FnAttrs::None);
+        let input_ty = m.func_ty(f32t, &[]);
+        let x_fn = m.declare("cpu.x", input_ty, FnAttrs::None);
+        let y_fn = m.declare("cpu.y", input_ty, FnAttrs::None);
+        let unary_ty = m.func_ty(f32t, &[i32t, f32t]);
+        let unary = m.declare("dx.op.unary.f32", unary_ty, FnAttrs::ReadNone);
+        let sink_ty = m.func_ty(void, &[f32t]);
+        let sink = m.declare("cpu.sink", sink_ty, FnAttrs::None);
+        let raw = m.call(mask_fn, &[]);
+        let zero = m.i32c(0);
+        let guard = m.cmp(Pred::Ne, raw, zero);
+        let x = m.call(x_fn, &[]);
+        let y = m.call(y_fn, &[]);
+        let selected = m.select(guard, x, y);
+        let sentinel = m.f32c((-101.0f32).to_bits());
+        for opcode in [83, 84, 85, 86, 6] {
+            let code = m.i32c(opcode);
+            let value = m.call(unary, &[code, selected]);
+            let guarded = m.select(guard, value, sentinel);
+            m.call(sink, &[guarded]);
+        }
+        m.ret();
+
+        let mut expected = Vec::new();
+        for seed in 1..=8 {
+            let k = seed as f32;
+            let x = [-k, 2.0 * k, 5.0 + k, -7.0 - k];
+            let y = [11.0 + k, -13.0 - k, -17.0 + k, 19.0 * k];
+            for mask in 0u32..16 {
+                let q: [f32; 4] = std::array::from_fn(|lane| if mask & (1 << lane) != 0 { x[lane] } else { y[lane] });
+                // A permitted coarse model uses the upper row / left column of the quad.
+                let rows = [
+                    [q[1] - q[0]; 4],
+                    [q[2] - q[0]; 4],
+                    [q[1] - q[0], q[1] - q[0], q[3] - q[2], q[3] - q[2]],
+                    [q[2] - q[0], q[3] - q[1], q[2] - q[0], q[3] - q[1]],
+                    x.map(f32::abs),
+                ];
+                let want: Vec<[u32; 4]> = rows.into_iter().map(|row| std::array::from_fn(|lane| {
+                    (if mask & (1 << lane) != 0 { row[lane] } else { -101.0 }).to_bits()
+                })).collect();
+                assert_eq!(evaluate(&m, mask, x, y), want, "unoptimized seed={seed}, mask={mask:04b}");
+                expected.push((seed, mask, x, y, want));
+            }
+        }
+        m.optimize();
+        for (seed, mask, x, y, want) in expected {
+            assert_eq!(evaluate(&m, mask, x, y), want, "optimized seed={seed}, mask={mask:04b}");
+        }
+    }
 }
