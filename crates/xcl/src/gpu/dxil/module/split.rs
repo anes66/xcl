@@ -759,6 +759,48 @@ mod tests {
     }
 
     #[test]
+    fn payload_slot_intervals_never_overlap_while_both_values_are_live() {
+        use super::{PayloadLifetime, Value, reuse_payload_slots};
+        let shapes: Vec<_> = (0..4).flat_map(|first| (first..4).flat_map(move |last| {
+            [1u32, 2].into_iter().map(move |words| (first, last, words))
+        })).collect();
+        let mut checked = 0;
+        for &a in &shapes { for &b in &shapes { for &c in &shapes {
+            let cases = [a, b, c];
+            let make = |reverse| {
+                let mut values: Vec<_> = cases.iter().enumerate().map(|(id, &(first, last, words))| {
+                    PayloadLifetime { value: Value::Inst(id as u32), first, last, words }
+                }).collect();
+                if reverse { values.reverse(); }
+                reuse_payload_slots(values).unwrap()
+            };
+            let (stride, slots) = make(false);
+            let (reverse_stride, reverse_slots) = make(true);
+            assert_eq!((stride, &slots), (reverse_stride, &reverse_slots));
+            assert_eq!(slots.len(), 3);
+            assert!(stride <= 1 + cases.iter().map(|c| c.2).sum::<u32>());
+            let mut disjoint = true;
+            for i in 0..3 {
+                let slot = slots[&Value::Inst(i as u32)];
+                assert!(slot > 0 && slot + cases[i].2 <= stride, "tag and bounds: {cases:?}");
+                for j in i + 1..3 {
+                    let overlap = cases[i].0 <= cases[j].1 && cases[j].0 <= cases[i].1;
+                    disjoint &= !overlap;
+                    if overlap {
+                        let other = slots[&Value::Inst(j as u32)];
+                        assert!(slot + cases[i].2 <= other || other + cases[j].2 <= slot,
+                            "live payloads share words: {cases:?}, slots={slots:?}");
+                    }
+                }
+            }
+            if disjoint { assert_eq!(stride, 1 + cases.iter().map(|c| c.2).max().unwrap()); }
+            checked += 1;
+        } } }
+        assert_eq!(checked, 8000);
+        println!("payload lifetime sets checked: {checked}; forward/reversed allocation for each");
+    }
+
+    #[test]
     fn oversized_loop_occupies_one_piece_up_to_the_hard_ceiling() {
         use super::{Block, Module};
 
@@ -946,6 +988,36 @@ mod tests {
                         }
                         assert_eq!(plan.edges.iter().map(|e| (e.from, e.to)).collect::<BTreeSet<_>>(), crossing);
                         assert_eq!(plan.edges.len(), crossing.len());
+                        let (stride, slots) = m.scratch_slots(&plan).expect("scratch layout");
+                        let values: BTreeSet<_> = plan.edges.iter().flat_map(|e| e.live.iter().copied())
+                            .filter(|&v| m.transport_words(v).unwrap() > 0).collect();
+                        assert_eq!(slots.len(), values.len());
+                        let fixed_stride = 1 + values.iter().map(|&v| m.transport_words(v).unwrap()).sum::<u32>();
+                        assert!(stride <= fixed_stride);
+                        if stride == fixed_stride {
+                            let mut offset = 1;
+                            for &value in &values {
+                                assert_eq!(slots[&value], offset, "no saving must preserve the fixed layout");
+                                offset += m.transport_words(value).unwrap();
+                            }
+                        }
+                        let spans: Vec<_> = values.iter().map(|&value| {
+                            let Value::Inst(i) = value else { unreachable!() };
+                            let first = stage[m.def_block[i as usize].0 as usize].unwrap();
+                            let last = plan.edges.iter().filter(|e| e.live.contains(&value))
+                                .map(|e| stage[e.to.0 as usize].unwrap()).max().unwrap();
+                            let slot = slots[&value];
+                            let words = m.transport_words(value).unwrap();
+                            assert!(slot > 0 && slot + words <= stride);
+                            (first, last, slot, words)
+                        }).collect();
+                        for (i, &(a, b, slot, words)) in spans.iter().enumerate() {
+                            for &(c, d, other, size) in &spans[i + 1..] {
+                                if a <= d && c <= b {
+                                    assert!(slot + words <= other || other + size <= slot, "live module values share scratch");
+                                }
+                            }
+                        }
                         for edge in &plan.edges {
                             let expected: BTreeSet<_> = reachable.iter().flat_map(|&b| m.blocks[b].iter().copied())
                                 .map(Value::Inst).filter(|&v| needed(&m, edge.from, edge.to, v)).collect();
