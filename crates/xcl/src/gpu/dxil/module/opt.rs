@@ -794,6 +794,157 @@ mod tests {
     }
 
     #[test]
+    fn integer_constant_folding_matches_wide_cpu_arithmetic() {
+        let mut checked = 0;
+        for width in [1, 8, 16, 32, 64] {
+            let mask = (1u128 << width) - 1;
+            let sign = 1u64 << (width - 1);
+            let values = [0, 1, 2, sign - 1, sign, sign + 1, mask as u64, 0x1234_5678_9abc_def0 & mask as u64];
+            let signed = |x: u64| x as i128 - if x & sign != 0 { 1i128 << width } else { 0 };
+            let mut m = Module::new();
+            m.define_entry("main");
+            let ty = m.int(width);
+            let void = m.void();
+            let sink_ty = m.func_ty(void, &[ty]);
+            let sink = m.declare("cpu_integer_sink", sink_ty, FnAttrs::NoUnwind);
+            let mut expected = Vec::new();
+            for x in values.map(|x| x & mask as u64) {
+                for y in values.map(|y| y & mask as u64) {
+                    let a = m.const_int(ty, x);
+                    let b = m.const_int(ty, y);
+                    let mut cases = vec![
+                        (BinOp::Add, (x as u128 + y as u128) & mask),
+                        (BinOp::Sub, ((x as i128 - y as i128) as u128) & mask),
+                        (BinOp::Mul, (x as u128 * y as u128) & mask),
+                        (BinOp::And, (x & y) as u128),
+                        (BinOp::Or, (x | y) as u128),
+                        (BinOp::Xor, (x ^ y) as u128),
+                    ];
+                    if y < width as u64 {
+                        cases.extend([
+                            (BinOp::Shl, ((x as u128) << y) & mask),
+                            (BinOp::LShr, (x as u128) >> y),
+                            (BinOp::AShr, ((signed(x) >> y) as u128) & mask),
+                        ]);
+                    }
+                    if y != 0 {
+                        cases.extend([(BinOp::UDiv, (x / y) as u128), (BinOp::URem, (x % y) as u128)]);
+                    }
+                    for (op, want) in cases {
+                        let value = m.bin(op, a, b);
+                        m.call(sink, &[value]);
+                        expected.push((op, x, y, want as u64));
+                    }
+                }
+            }
+            m.ret();
+            m.optimize();
+            let results: Vec<_> = m.blocks.iter().flatten().filter_map(|&i| match &m.insts[i as usize].op {
+                Op::Call(f, args) if *f == sink => Some(m.const_u64(args[0])),
+                _ => None,
+            }).collect();
+            assert_eq!(results.len(), expected.len());
+            for (got, (op, x, y, want)) in results.into_iter().zip(expected) {
+                assert_eq!(got, Some(want), "i{width} {op:?} {x:#x} {y:#x}");
+                checked += 1;
+            }
+        }
+        println!("{checked} integer folds matched CPU arithmetic");
+    }
+
+    #[test]
+    fn integer_cast_folding_matches_cpu_sign_extension() {
+        let mut checked = 0;
+        for source_width in [1, 8, 16, 32, 64] {
+            let source_mask = (1u128 << source_width) - 1;
+            let sign = 1u64 << (source_width - 1);
+            for dest_width in [1, 8, 16, 32, 64] {
+                if source_width == dest_width { continue; }
+                let dest_mask = (1u128 << dest_width) - 1;
+                let mut m = Module::new();
+                m.define_entry("main");
+                let source = m.int(source_width);
+                let dest = m.int(dest_width);
+                let void = m.void();
+                let sink_ty = m.func_ty(void, &[dest]);
+                let sink = m.declare("cpu_cast_sink", sink_ty, FnAttrs::NoUnwind);
+                let mut expected = Vec::new();
+                for x in [0, 1, sign - 1, sign, source_mask as u64] {
+                    let value = m.const_int(source, x);
+                    let signed = x as i128 - if x & sign != 0 { 1i128 << source_width } else { 0 };
+                    let cases = if source_width > dest_width {
+                        vec![(CastOp::Trunc, x as u128 & dest_mask)]
+                    } else {
+                        vec![(CastOp::ZExt, x as u128), (CastOp::SExt, signed as u128 & dest_mask)]
+                    };
+                    for (op, want) in cases {
+                        let result = m.cast(op, value, dest);
+                        m.call(sink, &[result]);
+                        expected.push((op, x, want as u64));
+                    }
+                }
+                m.ret();
+                m.optimize();
+                let results: Vec<_> = m.blocks.iter().flatten().filter_map(|&i| match &m.insts[i as usize].op {
+                    Op::Call(f, args) if *f == sink => Some(m.const_u64(args[0])),
+                    _ => None,
+                }).collect();
+                assert_eq!(results.len(), expected.len());
+                for (got, (op, x, want)) in results.into_iter().zip(expected) {
+                    assert_eq!(got, Some(want), "{op:?} i{source_width} {x:#x} -> i{dest_width}");
+                    checked += 1;
+                }
+            }
+        }
+        println!("{checked} integer casts matched CPU arithmetic");
+    }
+
+    #[test]
+    fn commutative_integer_cse_preserves_operand_direction() {
+        for width in [8, 16, 32, 64] {
+            let mut m = Module::new();
+            m.define_entry("main");
+            let ty = m.int(width);
+            let void = m.void();
+            let i1 = m.i1();
+            let input_ty = m.func_ty(ty, &[]);
+            let input = m.declare("cpu_input", input_ty, FnAttrs::NoUnwind);
+            let sink_ty = m.func_ty(void, &[ty, ty]);
+            let sink = m.declare("cpu_pair", sink_ty, FnAttrs::NoUnwind);
+            let bool_sink_ty = m.func_ty(void, &[i1, i1]);
+            let bool_sink = m.declare("cpu_compare_pair", bool_sink_ty, FnAttrs::NoUnwind);
+            let a = m.call(input, &[]);
+            let b = m.call(input, &[]);
+            for op in [BinOp::Add, BinOp::Mul, BinOp::And, BinOp::Or, BinOp::Xor, BinOp::Sub] {
+                let x = m.bin(op, a, b);
+                let y = m.bin(op, b, a);
+                m.call(sink, &[x, y]);
+            }
+            for (p, reverse) in [(Pred::Eq, Pred::Eq), (Pred::Ne, Pred::Ne), (Pred::ULt, Pred::UGt), (Pred::ULe, Pred::UGe), (Pred::UGt, Pred::ULt), (Pred::UGe, Pred::ULe), (Pred::SLt, Pred::SGt), (Pred::SLe, Pred::SGe), (Pred::SGt, Pred::SLt), (Pred::SGe, Pred::SLe)] {
+                let x = m.cmp(p, a, b);
+                let y = m.cmp(reverse, b, a);
+                m.call(bool_sink, &[x, y]);
+            }
+            m.ret();
+            m.optimize();
+            let mut arithmetic = 0;
+            let mut comparisons = 0;
+            for &i in m.blocks.iter().flatten() {
+                if let Op::Call(f, args) = &m.insts[i as usize].op {
+                    if *f == sink {
+                        assert_eq!(args[0] == args[1], arithmetic < 5, "i{width}, arithmetic pair {arithmetic}");
+                        arithmetic += 1;
+                    } else if *f == bool_sink {
+                        assert_eq!(args[0], args[1], "i{width}, comparison pair {comparisons}");
+                        comparisons += 1;
+                    }
+                }
+            }
+            assert_eq!((arithmetic, comparisons), (6, 10));
+        }
+    }
+
+    #[test]
     fn block_cse_invalidates_wave_and_quad_calls_across_discard() {
         let build = |op_name: &str, with_discard: bool| -> (Module, u32) {
             let mut m = Module::new();
