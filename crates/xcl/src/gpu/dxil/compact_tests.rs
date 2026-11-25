@@ -102,6 +102,50 @@ fn gpu_compact_form_spends_the_loop_budget_as_the_plain_form() {
     assert_eq!(&c.sgpr[..2], &p.sgpr[..2]);
 }
 
+fn early_outs(copies: usize) -> Vec<u8> {
+    let i = |n: &str, e: &str, f: &[(&str, u64)]| encode(n, e, f, None).unwrap_or_else(|x| panic!("{n}: {x}"));
+    let mut v = Vec::new();
+    for k in 0..copies {
+        v.extend(i("S_ADD_U32", "ENC_SOP2", &[("SDST", 0), ("SSRC0", 0), ("SSRC1", 1)]));
+        v.extend(i("S_CMP_EQ_U32", "ENC_SOPC", &[("SSRC0", 0), ("SSRC1", 2)]));
+        v.extend(i("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", ((copies - 1 - k) * 3 + 1) as u64)]));
+    }
+    v.extend(i("S_MOV_B32", "ENC_SOP1", &[("SDST", 3), ("SSRC0", 129)]));
+    v.extend(i("S_ENDPGM", "ENC_SOPP", &[]));
+    v
+}
+
+#[test]
+fn branches_to_many_places_keep_their_target_in_the_entry() {
+    let code = early_outs(1000);
+    let cfg = super::cfg::Cfg::build(&code).unwrap();
+    let leaders = cfg.blocks.iter().filter_map(|b| b.insts.first().map(|&i| cfg.insts[i].pc)).collect();
+    let o = KernelOptions { wave64: true, split: true, mem_windows: 1, sampler_base: 0 };
+    let lw = super::lower::Lw::new(&cfg.insts, &leaders, o, &super::kernel::Entry::Kernel);
+    let p = super::compact::plan(&cfg, &lw).unwrap();
+    assert_eq!((p.order.len(), p.steps.len()), (1002, 1002));
+    assert!(p.words() < 500, "{} words", p.words());
+}
+
+#[test]
+fn gpu_compact_form_with_targets_in_the_entry_runs_as_the_plain_form() {
+    match (runner::adapter(), runner::wave64_programs_supported(), crate::gpu::recomp::dxc::location()) {
+        (Ok(_), Ok(true), Ok(_)) => {}
+        (a, _, d) => return runner::skip_test(if a.is_err() { "no GPU" } else if d.is_err() { "no DXC" } else { "no wave64" }),
+    }
+    let mut st = KernelState::default();
+    (st.sgpr[1], st.sgpr[2]) = (3, 12);
+    let code = early_outs(40);
+    let o = KernelOptions { wave64: true, split: runner::split_wave64(), mem_windows: 1, sampler_base: 0 };
+    let run = |compact: bool| {
+        let k = translate_full_as(&code, o, compact).unwrap_or_else(|e| panic!("compact {compact}: {e}"));
+        runner::run_with_statics(&k.dxil, &st, &[], &[], &[], &k.static_samplers).expect("GPU run")
+    };
+    let (c, p) = (run(true), run(false));
+    assert_eq!(&c.sgpr[..4], &[12, 3, 12, 0]);
+    assert_eq!((c.sgpr, c.vgpr, c.scc), (p.sgpr, p.vgpr, p.scc));
+}
+
 #[test]
 fn a_mask_read_whole_after_one_copy_only_splits_the_class() {
     let i = |n: &str, e: &str, f: &[(&str, u64)]| encode(n, e, f, None).unwrap_or_else(|x| panic!("{n}: {x}"));

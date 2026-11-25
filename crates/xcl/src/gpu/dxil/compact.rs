@@ -17,21 +17,23 @@ pub struct Plan {
     pub next: Vec<(u32, u32)>,
     /// the distinct pairs of offsets from a block to its two successors, sorted
     pub steps: Vec<(u32, u32)>,
+    /// an entry holds the block's taken successor itself; the other one is the next block
+    pub inline: bool,
 }
 
 /// Most 32-bit words of tables a program may need to take the form by itself.
-const MAX_TABLE_WORDS: usize = 8192;
+const MAX_TABLE_WORDS: usize = 12288;
 
 impl Plan {
-    /// Bits of a table entry: the class, and the index of the pair of offsets.
+    /// Bits of a table entry: the class, and the taken successor or the index of the pair of offsets.
     fn widths(&self) -> (u32, u32) {
-        (bits(self.rep.len()), bits(self.steps.len()))
+        (bits(self.rep.len()), if self.inline { bits(self.order.len()) } else { bits(self.steps.len()) })
     }
 
-    /// 32-bit words of the two tables.
+    /// 32-bit words of the tables.
     pub fn words(&self) -> usize {
         let (cb, pb) = self.widths();
-        (self.order.len() * (cb + pb) as usize).div_ceil(32) + 1 + self.steps.len() * 2
+        (self.order.len() * (cb + pb) as usize).div_ceil(32) + 1 + if self.inline { 0 } else { self.steps.len() * 2 }
     }
 }
 
@@ -60,6 +62,7 @@ pub fn plan(cfg: &Cfg, lw: &Lw) -> Option<Plan> {
     }
     let mut ids: HashMap<(Vec<u64>, &'static str), u32> = HashMap::new();
     let (mut class, mut rep, mut next) = (Vec::new(), Vec::new(), Vec::new());
+    let mut falls = true;
     for (n, &b) in order.iter().enumerate() {
         let blk = &cfg.blocks[b];
         let mut key = vec![cfg.headers.contains(&b) as u64];
@@ -84,7 +87,10 @@ pub fn plan(cfg: &Cfg, lw: &Lw) -> Option<Plan> {
         let (end, to) = match blk.term {
             Term::End => ("end", (END, END)),
             Term::Jump(t) => ("jump", (number[t], number[t])),
-            Term::Cond(i, t, f) => (cfg.insts[i].inst.name, (number[t], number[f])),
+            Term::Cond(i, t, f) => {
+                falls &= number[f] == n as u32 + 1;
+                (cfg.insts[i].inst.name, (number[t], number[f]))
+            }
         };
         let fresh = ids.len() as u32;
         let c = *ids.entry((key, end)).or_insert(fresh);
@@ -95,7 +101,10 @@ pub fn plan(cfg: &Cfg, lw: &Lw) -> Option<Plan> {
         next.push(to);
     }
     let steps: BTreeSet<(u32, u32)> = next.iter().enumerate().map(|(b, &to)| offsets(b, to)).collect();
-    let p = Plan { order, class, rep, next, steps: steps.into_iter().collect() };
+    let mut p = Plan { order, class, rep, next, steps: steps.into_iter().collect(), inline: false };
+    let pairs = p.words();
+    p.inline = falls;
+    p.inline = falls && p.words() < pairs;
     let (cb, pb) = p.widths();
     (cb + pb <= 32).then_some(p)
 }
@@ -134,17 +143,21 @@ pub fn emit(lw: &mut Lw, cfg: &Cfg, p: &Plan, head: Block, exit: Block) -> LResu
     let n = p.order.len();
     let (cb, pb) = p.widths();
     let width = cb + pb;
-    let mut packed = vec![0u32; p.words() - p.steps.len() * 2];
+    let mut packed = vec![0u32; (n * width as usize).div_ceil(32) + 1];
     for (b, &to) in p.next.iter().enumerate() {
-        let pair = p.steps.binary_search(&offsets(b, to)).expect("a pair of the plan") as u32;
-        let e = (p.class[b] | pair << cb) as u64;
+        let field = match (p.inline, to.0) {
+            (true, END) => 0,
+            (true, t) => t,
+            _ => p.steps.binary_search(&offsets(b, to)).expect("a pair of the plan") as u32,
+        };
+        let e = (p.class[b] | field << cb) as u64;
         let at = b * width as usize;
         packed[at / 32] |= (e << (at % 32)) as u32;
         packed[at / 32 + 1] |= (e << (at % 32) >> 32) as u32;
     }
-    let steps: Vec<u32> = p.steps.iter().flat_map(|&(t, f)| [t, f]).collect();
     let blocks = table(lw, "xcl_blocks", &packed);
-    let steps = table(lw, "xcl_steps", &steps);
+    let steps: Vec<u32> = p.steps.iter().flat_map(|&(t, f)| [t, f]).collect();
+    let steps = (!p.inline).then(|| table(lw, "xcl_steps", &steps));
 
     let (at, to) = (lw.tmp_var(), lw.tmp_var());
     let (at, to, budget) = (slot(lw, at), slot(lw, to), slot(lw, VAR_BUDGET));
@@ -164,13 +177,17 @@ pub fn emit(lw: &mut Lw, cfg: &Cfg, p: &Plan, head: Block, exit: Block) -> LResu
     let hi = lw.shl(hi, up);
     let e = lw.or(lo, hi);
     let class = lw.andc(e, (1u32 << cb) - 1);
-    let pair = lw.lshrc(e, cb);
-    let pair = lw.andc(pair, (1u32 << pb) - 1);
-    let pi = lw.shlc(pair, 1);
-    let step_t = word(lw, steps, pi);
-    let pi1 = lw.addc(pi, 1);
-    let step_f = word(lw, steps, pi1);
-    let (taken, not_taken) = (lw.add(b, step_t), lw.add(b, step_f));
+    let field = lw.lshrc(e, cb);
+    let field = lw.andc(field, (1u32 << pb) - 1);
+    let (taken, not_taken) = if let Some(steps) = steps {
+        let pi = lw.shlc(field, 1);
+        let step_t = word(lw, steps, pi);
+        let pi1 = lw.addc(pi, 1);
+        let step_f = word(lw, steps, pi1);
+        (lw.add(b, step_t), lw.add(b, step_f))
+    } else {
+        (field, lw.addc(b, 1))
+    };
     let cases: Vec<Block> = p.rep.iter().map(|_| lw.block(Some(0))).collect();
     let latch = lw.block(Some(0));
     let arms: Vec<(Value, Block)> = cases.iter().enumerate().skip(1).map(|(k, &c)| (lw.c(k as u32), c)).collect();
