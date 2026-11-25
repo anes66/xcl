@@ -806,6 +806,161 @@ mod tests {
         assert!(m.dispatch_plan(4).is_none());
     }
 
+    #[test]
+    fn dispatch_plan_matches_forward_liveness_and_independent_sccs() {
+        use super::{Block, Module, Op, Value};
+        use std::collections::BTreeSet;
+
+        fn needed(m: &Module, from: Block, to: Block, value: Value) -> bool {
+            let phi_reads = |p: Block, b: Block| m.blocks[b.0 as usize].iter().any(|&i| {
+                matches!(&m.insts[i as usize].op, Op::Phi(inc) if inc.contains(&(value, p)))
+            });
+            if phi_reads(from, to) { return true; }
+            let Value::Inst(i) = value else { unreachable!() };
+            let definition = m.def_block[i as usize];
+            let mut seen = BTreeSet::new();
+            let mut pending = vec![to];
+            while let Some(b) = pending.pop() {
+                if b == definition || !seen.insert(b) { continue; }
+                for &i in &m.blocks[b.0 as usize] {
+                    let op = &m.insts[i as usize].op;
+                    if matches!(op, Op::Phi(_)) { continue; }
+                    let mut reads = false;
+                    op.for_each_operand(|v| reads |= v == value);
+                    if reads { return true; }
+                }
+                for next in m.successors(b.0 as usize) {
+                    if phi_reads(b, next) { return true; }
+                    pending.push(next);
+                }
+            }
+            false
+        }
+
+        let mut checked = 0;
+        let mut edge_checks = 0;
+        for reverse in [false, true] {
+            for rotation in 0..9 {
+                for padding in [0, 2] {
+                    let mut m = Module::new();
+                    m.define_entry("main");
+                    let entry = m.entry_block();
+                    let mut roles = [0usize, 1, 2, 3, 4, 5, 6, 7, 8];
+                    roles.rotate_left(rotation);
+                    if reverse { roles.reverse(); }
+                    let mut blocks = [entry; 9];
+                    for role in roles { blocks[role] = m.new_block(); }
+                    let [left, right, join, header, body, after, skip, finish, dead] = blocks;
+                    let word = m.i32();
+                    let void = m.void();
+                    let src_ty = m.func_ty(word, &[]);
+                    let src = m.declare("cpu.input", src_ty, crate::gpu::dxil::module::FnAttrs::None);
+                    let sink_ty = m.func_ty(void, &[word]);
+                    let sink = m.declare("cpu.sink", sink_ty, crate::gpu::dxil::module::FnAttrs::None);
+                    let seed = m.call(src, &[]);
+                    let zero = m.i32c(0);
+                    let one = m.i32c(1);
+                    let three = m.i32c(3);
+                    let choose = m.cmp(Pred::Eq, seed, zero);
+                    m.cond_br(choose, left, right);
+                    m.set_block(left);
+                    let l = m.bin(BinOp::Add, seed, one);
+                    m.br(join);
+                    m.set_block(right);
+                    let r = m.bin(BinOp::Add, seed, three);
+                    m.br(join);
+                    m.set_block(join);
+                    let joined = m.phi(word);
+                    m.add_incoming(joined, l, left);
+                    m.add_incoming(joined, r, right);
+                    let loop_or_skip = m.cmp(Pred::ULt, joined, three);
+                    m.cond_br(loop_or_skip, header, skip);
+                    m.set_block(header);
+                    let count = m.phi(word);
+                    let carried = m.phi(word);
+                    m.add_incoming(count, zero, join);
+                    m.add_incoming(carried, joined, join);
+                    let again = m.cmp(Pred::ULt, count, three);
+                    m.cond_br(again, body, after);
+                    m.set_block(body);
+                    let next = m.bin(BinOp::Add, count, one);
+                    let updated = m.bin(BinOp::Add, carried, seed);
+                    m.add_incoming(count, next, body);
+                    m.add_incoming(carried, updated, body);
+                    for _ in 0..padding { m.call(sink, &[updated]); }
+                    m.br(header);
+                    m.set_block(after);
+                    m.call(sink, &[carried]);
+                    m.br(finish);
+                    m.set_block(skip);
+                    let skipped = m.bin(BinOp::Add, joined, seed);
+                    m.br(finish);
+                    m.set_block(finish);
+                    let result = m.phi(word);
+                    m.add_incoming(result, carried, after);
+                    m.add_incoming(result, skipped, skip);
+                    m.call(sink, &[result]);
+                    m.ret();
+                    m.set_block(dead);
+                    for _ in 0..100 { m.call(sink, &[seed]); }
+                    m.ret();
+
+                    let reachable = m.block_layout().0;
+                    let n = m.blocks.len();
+                    let total: usize = reachable.iter().map(|&b| m.blocks[b].len()).sum();
+                    assert!(m.dispatch_plan(0).is_none());
+                    assert!(m.dispatch_plan(total).is_none(), "a fitting program needs no chain");
+                    // Transitive closure is independent of the planner's Kosaraju traversal.
+                    let mut reaches = vec![vec![false; n]; n];
+                    for &b in &reachable {
+                        reaches[b][b] = true;
+                        for t in m.successors(b) { reaches[b][t.0 as usize] = true; }
+                    }
+                    for k in 0..n { for a in 0..n { for b in 0..n {
+                        reaches[a][b] |= reaches[a][k] && reaches[k][b];
+                    } } }
+                    for limit in [3, 4, 5, 8, 12, 16] {
+                        let plan = m.dispatch_plan(limit).expect("fixture has several bounded components");
+                        let mut stage = vec![None; n];
+                        for (s, blocks) in plan.blocks.iter().enumerate() {
+                            assert!(!blocks.is_empty());
+                            for &b in blocks { assert!(stage[b.0 as usize].replace(s).is_none()); }
+                            let cost: usize = blocks.iter().map(|b| m.blocks[b.0 as usize].len()).sum();
+                            if cost > limit {
+                                let first = blocks[0].0 as usize;
+                                assert!(blocks.iter().all(|b| reaches[first][b.0 as usize] && reaches[b.0 as usize][first]));
+                                assert!(cost <= 4 * limit, "only a bounded indivisible SCC may exceed the target");
+                            }
+                        }
+                        assert!(stage[dead.0 as usize].is_none(), "unreachable cost must not enter the plan");
+                        assert_eq!(stage.iter().filter(|s| s.is_some()).count(), reachable.len());
+                        let mut crossing = BTreeSet::new();
+                        for &b in &reachable {
+                            for &a in &reachable {
+                                if reaches[a][b] && reaches[b][a] { assert_eq!(stage[a], stage[b], "SCC was split"); }
+                            }
+                            for t in m.successors(b) {
+                                assert!(stage[b] <= stage[t.0 as usize], "dispatch edge must not go backward");
+                                if stage[b] != stage[t.0 as usize] { crossing.insert((Block(b as u32), t)); }
+                            }
+                        }
+                        assert_eq!(plan.edges.iter().map(|e| (e.from, e.to)).collect::<BTreeSet<_>>(), crossing);
+                        assert_eq!(plan.edges.len(), crossing.len());
+                        for edge in &plan.edges {
+                            let expected: BTreeSet<_> = reachable.iter().flat_map(|&b| m.blocks[b].iter().copied())
+                                .map(Value::Inst).filter(|&v| needed(&m, edge.from, edge.to, v)).collect();
+                            assert_eq!(edge.live.iter().copied().collect::<BTreeSet<_>>(), expected, "payload {:?} -> {:?}", edge.from, edge.to);
+                            assert_eq!(edge.live.len(), expected.len(), "payload values must not repeat");
+                            edge_checks += 1;
+                        }
+                        checked += 1;
+                    }
+                }
+            }
+        }
+        println!("dispatch plans checked: {checked}; crossing payloads checked: {edge_checks}");
+    }
+
     fn compare(threads: u32, extra_adds: u32, run_gpu: bool) {
         if run_gpu && !runner::wave32_supported().unwrap_or(false) {
             runner::skip_test("no wave32 GPU");
