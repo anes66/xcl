@@ -168,3 +168,64 @@ fn a_mask_read_whole_after_one_copy_only_splits_the_class() {
     assert_eq!(p.order.len(), 4);
     assert_ne!(p.class[0], p.class[2]);
 }
+
+#[test]
+fn gpu_compact_inline_table_above_old_cap_checks_late_entries() {
+    if compact_mode().is_some() {
+        return;
+    }
+    match (runner::adapter(), runner::wave64_programs_supported(), crate::gpu::recomp::dxc::location()) {
+        (Ok(_), Ok(true), Ok(_)) => {}
+        (a, _, d) => return runner::skip_test(if a.is_err() { "no GPU" } else if d.is_err() { "no DXC" } else { "no wave64" }),
+    }
+    const COPIES: usize = 8192;
+    let i = |n: &str, e: &str, f: &[(&str, u64)]| encode(n, e, f, None).unwrap_or_else(|x| panic!("{n}: {x}"));
+    let mut code = Vec::new();
+    code.extend(i("S_MOV_B32", "ENC_SOP1", &[("SDST", 2), ("SSRC0", 2)]));
+    for r in [2, 3] {
+        code.extend(i("V_MOV_B32", "ENC_VOP1", &[("VDST", r), ("SRC0", 256 + r)]));
+    }
+    for marker in [3, 4] {
+        for k in 0..COPIES {
+            code.extend(i("S_ADD_U32", "ENC_SOP2", &[("SDST", 0), ("SSRC0", 0), ("SSRC1", 1)]));
+            code.extend(i("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 1), ("SRC0", 256), ("VSRC1", 1)]));
+            let offset = (COPIES - 1 - k) * 3 + 1;
+            assert!(offset <= i16::MAX as usize);
+            code.extend(i("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", offset as u64)]));
+        }
+        code.extend(i("S_MOV_B32", "ENC_SOP1", &[("SDST", marker), ("SSRC0", 129)]));
+    }
+    code.extend(i("S_ENDPGM", "ENC_SOPP", &[]));
+    let o = KernelOptions { wave64: true, split: runner::split_wave64(), mem_windows: 1, sampler_base: 0 };
+    let cfg = super::cfg::Cfg::build(&code).unwrap();
+    let leaders = cfg.blocks.iter().filter_map(|b| b.insts.first().map(|&i| cfg.insts[i].pc)).collect();
+    let lw = super::lower::Lw::new(&cfg.insts, &leaders, o, &super::kernel::Entry::Kernel);
+    let p = super::compact::plan(&cfg, &lw).unwrap();
+    assert!(p.inline && p.words() > 8192 && p.words() <= 12288);
+    assert!(super::compact::wanted(&cfg, &p));
+    let k = translate_full(&code, o).unwrap();
+    for initial in [0u32, u32::MAX - 1, 0u32.wrapping_sub(COPIES as u32), 0u32.wrapping_sub((2 * COPIES) as u32), 0u32.wrapping_sub(COPIES as u32 + 1)] {
+        let mut st = KernelState::default();
+        st.sgpr[0] = initial;
+        st.sgpr[1] = 1;
+        st.sgpr[2] = 0x1234;
+        for lane in 0..KERNEL_LANES {
+            st.vgpr[lane][..4].copy_from_slice(&[lane as u32, 17, 0x12345678, 0x87654321]);
+        }
+        let (mut value, mut count, mut marks, mut carry) = (initial, 0u32, [0u32; 2], false);
+        for mark in &mut marks {
+            for n in 0..COPIES {
+                (value, carry) = value.overflowing_add(1);
+                count += 1;
+                if carry { break; }
+                if n + 1 == COPIES { *mark = 1; }
+            }
+        }
+        let out = runner::run_with_statics(&k.dxil, &st, &[], &[], &[], &k.static_samplers).expect("GPU run");
+        assert_eq!(&out.sgpr[..5], &[value, 1, 0x1234, marks[0], marks[1]], "initial {initial:#x}");
+        assert_eq!(out.scc, carry as u32);
+        for lane in 0..KERNEL_LANES {
+            assert_eq!(&out.vgpr[lane][..4], &[lane as u32, 17 + count * lane as u32, 0x12345678, 0x87654321], "initial {initial:#x} lane {lane}");
+        }
+    }
+}
