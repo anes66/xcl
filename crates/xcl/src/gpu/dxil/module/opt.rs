@@ -1708,4 +1708,108 @@ mod tests {
         m.optimize();
         assert!(m.successors(body.0 as usize).contains(&latch));
     }
+
+    #[test]
+    fn simplify_cfg_preserves_nested_latches_and_phi_edges_across_layouts() {
+        for reverse in [false, true] {
+            for rotation in 0..7 {
+                for switch in [false, true] {
+                    let mut m = Module::new();
+                    m.define_entry("main");
+                    let entry = m.entry_block();
+                    let mut allocation = [0usize, 1, 2, 3, 4, 5, 6];
+                    allocation.rotate_left(rotation);
+                    if reverse { allocation.reverse(); }
+                    let mut blocks = [entry; 7];
+                    for role in allocation { blocks[role] = m.new_block(); }
+                    let [outer, inner, body, inner_latch, outer_latch, exit, forward] = blocks;
+                    let i32t = m.i32();
+                    let void = m.void();
+                    let src_ty = m.func_ty(i32t, &[]);
+                    let src = m.declare("dx.op.waveGetLaneIndex", src_ty, FnAttrs::ReadNone);
+                    let sink_ty = m.func_ty(void, &[i32t]);
+                    let sink = m.declare("dx.op.storeOutput.i32", sink_ty, FnAttrs::NoUnwind);
+
+                    m.set_block(entry);
+                    let lane = m.call(src, &[]);
+                    let zero = m.i32c(0);
+                    let one = m.i32c(1);
+                    let limit = m.i32c(5);
+                    m.br(forward);
+                    m.set_block(forward);
+                    m.br(outer);
+                    m.set_block(outer);
+                    let outer_iv = m.phi(i32t);
+                    m.add_incoming(outer_iv, zero, forward);
+                    m.call(sink, &[outer_iv]);
+                    m.br(inner);
+                    m.set_block(inner);
+                    let inner_iv = m.phi(i32t);
+                    m.add_incoming(inner_iv, zero, outer);
+                    let go = m.cmp(Pred::ULt, inner_iv, limit);
+                    m.cond_br(go, body, exit);
+                    m.set_block(body);
+                    let next_inner = m.bin(BinOp::Add, inner_iv, one);
+                    let next_outer = m.bin(BinOp::Add, outer_iv, one);
+                    m.call(sink, &[next_inner]);
+                    if switch {
+                        // Two switch edges share a latch; the header still has one incoming edge.
+                        m.switch(lane, outer_latch, &[(zero, inner_latch), (one, inner_latch)]);
+                    } else {
+                        let again = m.cmp(Pred::Eq, lane, zero);
+                        m.cond_br(again, inner_latch, outer_latch);
+                    }
+                    m.set_block(inner_latch);
+                    m.br(inner);
+                    m.add_incoming(inner_iv, next_inner, inner_latch);
+                    m.set_block(outer_latch);
+                    m.br(outer);
+                    m.add_incoming(outer_iv, next_outer, outer_latch);
+                    m.set_block(exit);
+                    m.call(sink, &[inner_iv]);
+                    m.ret();
+
+                    for _ in 0..2 {
+                        m.optimize();
+                        let (layout, pos) = m.block_layout();
+                        let order: Vec<u32> = layout.iter().map(|&b| b as u32).collect();
+                        assert!(m.uses_well_formed(&order));
+                        let mut returns = vec![0; m.blocks.len()];
+                        for &b in &layout {
+                            let mut targets = m.successors(b);
+                            targets.sort_by_key(|t| t.0);
+                            targets.dedup();
+                            let back: Vec<_> = targets.into_iter().filter(|t| pos[t.0 as usize] <= pos[b]).collect();
+                            assert!(back.len() <= 1, "multiple back edges: reverse={reverse}, rotation={rotation}, switch={switch}");
+                            for t in back { returns[t.0 as usize] += 1; }
+                            for &i in &m.blocks[b] {
+                                let Op::Phi(inc) = &m.insts[i as usize].op else { break };
+                                let mut actual: Vec<_> = layout.iter().flat_map(|&p| {
+                                    m.successors(p).into_iter().filter(move |t| t.0 as usize == b).map(move |_| p as u32)
+                                }).collect();
+                                let mut recorded: Vec<_> = inc.iter().map(|&(_, p)| p.0).collect();
+                                actual.sort_unstable();
+                                recorded.sort_unstable();
+                                assert_eq!(recorded, actual, "phi predecessors must match live edge multiplicity");
+                            }
+                        }
+                        assert!(returns.iter().all(|&n| n <= 1));
+                        assert_eq!(returns.iter().sum::<usize>(), 2, "both loops must remain");
+                        assert!(!m.blocks[inner_latch.0 as usize].is_empty());
+                        assert!(!m.blocks[outer_latch.0 as usize].is_empty());
+                        assert!(m.blocks[forward.0 as usize].is_empty(), "forward trampolines must still be removed");
+                        for (phi, expected) in [
+                            (outer_iv, [(zero, entry), (next_outer, outer_latch)]),
+                            (inner_iv, [(zero, outer), (next_inner, inner_latch)]),
+                        ] {
+                            let Value::Inst(i) = phi else { unreachable!() };
+                            let Op::Phi(inc) = &m.insts[i as usize].op else { panic!("loop phi was lost") };
+                            assert_eq!(inc.len(), expected.len());
+                            assert!(expected.iter().all(|edge| inc.contains(edge)), "loop-carried values changed");
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
