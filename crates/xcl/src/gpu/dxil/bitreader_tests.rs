@@ -99,6 +99,10 @@ pub(super) fn parse(bc: &[u8]) -> Block {
 
 const BLOCK_FUNCTION: u32 = 12;
 const FUNC_CODE_INST_BINOP: u32 = 2;
+const FUNC_CODE_INST_CALL: u32 = 34;
+const FUNC_CODE_INST_GEP: u32 = 43;
+const FUNC_CODE_INST_SWITCH: u32 = 12;
+const FUNC_CODE_INST_PHI: u32 = 16;
 const FUNC_CODE_INST_ATOMICRMW: u32 = 38;
 const FUNC_CODE_INST_CMPXCHG: u32 = 46;
 /// `bitc::ORDERING_SEQCST` (the in-memory `AtomicOrdering` value is 7, the
@@ -157,6 +161,81 @@ fn atomics_use_bitcode_ordering_codes() {
     // [ptr, cmp, new, vol, success, synchscope, failure, weak]
     assert_eq!(cx[0][4], ORDERING_SEQCST, "cmpxchg success ordering: {:?}", cx[0]);
     assert_eq!(cx[0][6], ORDERING_SEQCST, "cmpxchg failure ordering: {:?}", cx[0]);
+}
+
+fn mixed_operand_module(extra_binops: usize) -> Module {
+    use super::module::FnAttrs;
+    let mut m = Module::new();
+    m.define_entry("main");
+    let (i32, void) = (m.i32(), m.void());
+    let input_ty = m.func_ty(i32, &[]);
+    let input = m.declare("cpu_input", input_ty, FnAttrs::NoUnwind);
+    let long_ty = m.func_ty(void, &[i32; 8]);
+    let long = m.declare("cpu_long", long_ty, FnAttrs::NoUnwind);
+    let short_ty = m.func_ty(void, &[]);
+    let short = m.declare("cpu_short", short_ty, FnAttrs::NoUnwind);
+    let x = m.call(input, &[]);
+    let (zero, one, two) = (m.i32c(0), m.i32c(1), m.i32c(2));
+    m.call(long, &[x, one, two, zero, x, one, two, zero]);
+    m.call(short, &[]);
+    let inner = m.array(4, i32);
+    let outer = m.array(3, inner);
+    let g = m.global("g", outer, 3, None, false, 4);
+    m.gep(g, &[zero, one, two]);
+    m.gep(g, &[zero, one]);
+    let sum = m.bin_flags(BinOp::Add, one, two, 3);
+    let mut value = m.bin(BinOp::Xor, sum, x);
+    for i in 0..extra_binops {
+        let c = m.i32c(i as u32 + 3);
+        value = m.bin(if i % 2 == 0 { BinOp::Add } else { BinOp::Xor }, value, c);
+    }
+    let (left, right, join, exit) = (m.new_block(), m.new_block(), m.new_block(), m.new_block());
+    let cases: Vec<_> = (0..8).map(|i| (m.i32c(i), left)).collect();
+    m.switch(x, right, &cases);
+    m.set_block(left);
+    m.br(join);
+    m.set_block(right);
+    m.switch(x, join, &[(zero, left)]);
+    m.set_block(join);
+    let phi = m.phi(i32);
+    m.add_incoming(phi, value, left);
+    m.add_incoming(phi, two, right);
+    m.br(exit);
+    m.set_block(exit);
+    let last = m.phi(i32);
+    m.add_incoming(last, phi, join);
+    m.ret();
+    m
+}
+
+#[test]
+fn mixed_long_and_short_records_do_not_share_operands() {
+    let root = parse(&mixed_operand_module(0).to_bitcode("dxil-ms-dx", ""));
+    let f = root.find(BLOCK_FUNCTION).unwrap();
+    for (code, lengths) in [(FUNC_CODE_INST_CALL, vec![4, 12, 4]), (FUNC_CODE_INST_GEP, vec![6, 5]), (FUNC_CODE_INST_BINOP, vec![4, 3]), (FUNC_CODE_INST_SWITCH, vec![19, 5]), (FUNC_CODE_INST_PHI, vec![5, 3])] {
+        let actual: Vec<_> = f.records_with(code).iter().map(|ops| ops.len()).collect();
+        assert_eq!(actual, lengths, "instruction record {code}");
+    }
+}
+
+#[test]
+fn large_mixed_bitcode_is_repeatable() {
+    let mut m = mixed_operand_module(8192);
+    let expected = m.to_bitcode("dxil-ms-dx", "");
+    if let Some(path) = std::env::var_os("XCL_TEST_BITCODE_OUT") {
+        std::fs::write(path, &expected).expect("write synthetic bitcode");
+    }
+    let root = parse(&expected);
+    assert_eq!(root.find(BLOCK_FUNCTION).unwrap().records_with(FUNC_CODE_INST_BINOP).len(), 8194);
+    let mut times = Vec::new();
+    for _ in 0..9 {
+        let start = std::time::Instant::now();
+        let actual = m.to_bitcode("dxil-ms-dx", "");
+        times.push(start.elapsed());
+        assert_eq!(actual, expected);
+    }
+    times.sort();
+    println!("mixed bitcode: {} bytes, FNV64 {:016x}, median writer {:?}", expected.len(), crate::gpu::shader::fnv64(&expected), times[4]);
 }
 
 #[test]
