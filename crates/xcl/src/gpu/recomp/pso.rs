@@ -1337,6 +1337,42 @@ mod shader_cache_tests {
     }
 
     #[test]
+    fn dxil_no_opt_bypasses_populated_ram_and_disk() {
+        const CHILD: &str = "XCL_TEST_NO_OPT_CACHE_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let dir = std::env::temp_dir().join(format!("xcl-no-opt-cache-{}", std::process::id()));
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command.args(["--exact", "gpu::recomp::pso::shader_cache_tests::dxil_no_opt_bypasses_populated_ram_and_disk", "--nocapture", "--test-threads=1"])
+                .env(CHILD, "1").env("XCL_DXIL_NO_OPT", "all").env("XCL_DIRECT_DXIL", "all")
+                .env("XCL_DXIL_CACHE", &dir).env("XCL_TRANSLATED_CACHE", "1");
+            for name in ["XCL_RECOMP_NO_STRUCTURED", "XCL_RECOMP_WHY", "XCL_X64_ALL_MASKS", "XCL_WAVE64_SPIN", "XCL_DEBUG_MAGENTA", "XCL_DEBUG_LOD0", "XCL_DEBUG_PS_SUB", "XCL_DEBUG_PS_EXPR", "XCL_DXC_ARGS"] {
+                command.env_remove(name);
+            }
+            let output = command.output().expect("CPU cache child");
+            let _ = std::fs::remove_dir_all(&dir);
+            assert!(output.status.success(), "{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+            return;
+        }
+        let dir = dxc::cache_dir();
+        let blob = b"synthetic invalid shader for cache routing";
+        for stage in [Stage::Compute, Stage::Vertex, Stage::Pixel] {
+            let disk = translated::cached(&dir, blob, stage, 0, 1, false, || Ok(compiled(7))).unwrap();
+            assert_eq!(disk.dxil[0], 7);
+            // Without the RAM entry the public path would find the disk entry instead.
+            assert!(console_to_dxil_in(blob, stage, 0, false, 1).is_err(), "{stage:?}: normal disk entry bypassed the diagnostic translation");
+            let key = ShaderKey { hash: crate::gpu::shader::fnv64(blob), stage, sampler_base: 0, windows: 1, split_wave64: false, cache_dir: dir.clone() };
+            let ram = cached_shader(shader_cache(), key.clone(), blob, || Ok(compiled(9))).unwrap();
+            assert_eq!(ram.dxil[0], 9);
+            assert!(console_to_dxil_in(blob, stage, 0, false, 1).is_err(), "{stage:?}: normal RAM entry bypassed the diagnostic translation");
+            let preserved_ram = cached_shader(shader_cache(), key, blob, || panic!("normal RAM cache was modified")).unwrap();
+            assert!(Arc::ptr_eq(&ram, &preserved_ram));
+            let preserved_disk = translated::cached(&dir, blob, stage, 0, 1, false, || panic!("normal disk cache was modified")).unwrap();
+            assert_eq!(preserved_disk.dxil, disk.dxil);
+            assert_eq!(preserved_disk.samplers, disk.samplers);
+        }
+    }
+
+    #[test]
     fn shader_cache_bypasses_debug_overrides() {
         for name in ["XCL_RECOMP_NO_STRUCTURED", "XCL_RECOMP_WHY", "XCL_X64_ALL_MASKS", "XCL_WAVE64_SPIN", "XCL_DXIL_NO_OPT"] {
             assert!(!cache_allowed(Stage::Compute, |v| v == name));
