@@ -45,6 +45,50 @@ fn dump_dxc_lowering() {
 }
 
 #[test]
+fn cpu_integer_folding_keeps_validator_feature_flags_consistent() {
+    use super::{container::Stage, module::{BinOp, CastOp}, shader::{Feature, Shader}, validate};
+    for mode in ["unused", "constant", "high zero", "live"] {
+        let mut s = Shader::new(Stage::Compute, (6, 6));
+        let io = s.raw_uav(0, 0);
+        let res = s.raw_uav(1, 0);
+        let lane = s.thread_id_in_group(0);
+        let two = s.m.i32c(2);
+        let off = s.m.bin(BinOp::Shl, lane, two);
+        let input = s.raw_load(io, off, 1)[0];
+        let (i32t, i64t) = (s.m.i32(), s.m.i64());
+        s.require(Feature::Int64Ops);
+        let output = match mode {
+            "unused" => input,
+            "constant" => {
+                let a = s.m.const_int(i64t, u64::MAX);
+                let b = s.m.const_int(i64t, 2);
+                let sum = s.m.bin(BinOp::Add, a, b);
+                s.m.cast(CastOp::Trunc, sum, i32t)
+            }
+            "high zero" => {
+                let value = s.m.cast(CastOp::ZExt, input, i64t);
+                let shift = s.m.const_int(i64t, 32);
+                let high = s.m.bin(BinOp::LShr, value, shift);
+                s.m.cast(CastOp::Trunc, high, i32t)
+            }
+            _ => {
+                let value = s.m.cast(CastOp::ZExt, input, i64t);
+                let factor = s.m.const_int(i64t, 0x1234_5678_9abc_def1);
+                let product = s.m.bin(BinOp::Mul, value, factor);
+                let shift = s.m.const_int(i64t, 33);
+                let high = s.m.bin(BinOp::LShr, product, shift);
+                s.m.cast(CastOp::Trunc, high, i32t)
+            }
+        };
+        s.raw_store(res, off, &[output]);
+        let dxil = s.finish([32, 1, 1], Some(32));
+        validate::validate(&dxil).unwrap_or_else(|e| panic!("{mode}: {e}"));
+        let dis = validate::disassemble(&dxil).expect("CPU disassembly");
+        assert_eq!(dis.contains("64-Bit integer"), mode == "live", "{mode}: {dis}");
+    }
+}
+
+#[test]
 fn f64_conversions_validate() {
     for (name, enc) in [("V_CVT_F32_F64", "ENC_VOP1"), ("V_CVT_F64_F32", "ENC_VOP1"), ("V_CVT_I32_F64", "ENC_VOP1"), ("V_CVT_F64_I32", "ENC_VOP1")] {
         let code = prog(&[(name, enc, &[("VDST", 2), ("SRC0", 256)], None)]);
