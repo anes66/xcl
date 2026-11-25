@@ -815,3 +815,58 @@ fn resolve(repl: &mut [Option<Value>], v: Value) -> Value {
     }
     r
 }
+
+#[cfg(test)]
+mod cpu_float_tests {
+    use super::*;
+
+    #[test]
+    fn float_constant_predicates_match_ieee_bit_order() {
+        let values: [u32; 18] = [0, 0x8000_0000, 0x3f80_0000, 0xbf80_0000, 0x4000_0000, 0xc000_0000, 0x0080_0000, 0x8080_0000, 0x7f7f_ffff, 0xff7f_ffff, 0x7f80_0000, 0xff80_0000, 0x7fc0_0001, 0xffc0_0001, 0x7f80_0001, 0xff80_0001, 1, 0x8000_0001];
+        let predicates = [Pred::FFalse, Pred::FOEq, Pred::FOGt, Pred::FOGe, Pred::FOLt, Pred::FOLe, Pred::FONe, Pred::FOrd, Pred::FUno, Pred::FUEq, Pred::FUGt, Pred::FUGe, Pred::FULt, Pred::FULe, Pred::FUNe, Pred::FTrue];
+        let denormal = |v: u32| v & 0x7f80_0000 == 0 && v & 0x007f_ffff != 0;
+        let nan = |v: u32| v & 0x7fff_ffff > 0x7f80_0000;
+        let key = |v: u32| if v & 0x8000_0000 != 0 { !v } else { v | 0x8000_0000 };
+        let mut m = Module::new();
+        m.define_entry("main");
+        let (void, f32t, i1) = (m.void(), m.f32(), m.i1());
+        let sink_ty = m.func_ty(void, &[i1]);
+        let sink = m.declare("cpu_float_compare_sink", sink_ty, FnAttrs::NoUnwind);
+        let mut expected = Vec::new();
+        for x in values {
+            for y in values {
+                let a = m.const_float(f32t, x as u64);
+                let b = m.const_float(f32t, y as u64);
+                // Predicate bits select equality, greater, less and unordered, respectively.
+                let relation = if nan(x) || nan(y) { 8 }
+                    else if x & 0x7fff_ffff == 0 && y & 0x7fff_ffff == 0 { 1 }
+                    else { match key(x).cmp(&key(y)) { std::cmp::Ordering::Equal => 1, std::cmp::Ordering::Greater => 2, std::cmp::Ordering::Less => 4 } };
+                for p in predicates {
+                    let value = m.cmp(p, a, b);
+                    m.call(sink, &[value]);
+                    let want = if denormal(x) || denormal(y) { None } else { Some(u64::from(p as u32 & relation != 0)) };
+                    expected.push((p, x, y, want));
+                }
+            }
+        }
+        let null = m.null(f32t);
+        let zero = m.f32c(0);
+        let equal = m.cmp(Pred::FOEq, null, zero);
+        m.call(sink, &[equal]);
+        expected.push((Pred::FOEq, 0, 0, Some(1)));
+        m.ret();
+        m.optimize();
+        let results: Vec<_> = m.blocks.iter().flatten().filter_map(|&i| match &m.insts[i as usize].op {
+            Op::Call(f, args) if *f == sink => Some(m.const_u64(args[0])),
+            _ => None,
+        }).collect();
+        assert_eq!(results.len(), expected.len());
+        let (mut folded, mut preserved) = (0, 0);
+        for (got, (p, x, y, want)) in results.into_iter().zip(expected) {
+            assert_eq!(got, want, "{p:?}: {x:08x}, {y:08x}");
+            if want.is_some() { folded += 1; } else { preserved += 1; }
+        }
+        assert_eq!((folded, preserved), (4097, 1088));
+        println!("{folded} float comparisons folded correctly; {preserved} denormal comparisons preserved");
+    }
+}
