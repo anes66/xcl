@@ -4,6 +4,8 @@
 //! loads, stores, barriers and atomics; wave reads; raw buffer I/O). Every
 //! module must pass DXC's validator; a subset also runs on the GPU and is
 //! compared with a CPU interpreter of the same program.
+//! `XCL_FUZZ_CPU_ONLY=1` validates without querying GPU capabilities or executing
+//! shaders. Batch reports then explicitly show zero GPU comparisons.
 //!
 //! Exactness: float values are small integers (|x| < 64, at most two
 //! arithmetic steps from a conversion), so every add / sub / mul result is
@@ -1153,6 +1155,10 @@ fn check_valid(seed: u64, c: &[u8]) {
     }
 }
 
+fn fuzz_cpu_only() -> bool {
+    std::env::var("XCL_FUZZ_CPU_ONLY").as_deref() == Ok("1")
+}
+
 fn compare_seed_on_gpu(seed: u64, p: &Prog, c: &[u8]) {
     let mem = inputs(seed);
     let r = runner::run_with(c, &runner::KernelState::default(), &mem, &[], &[])
@@ -1166,7 +1172,7 @@ fn compare_seed_on_gpu(seed: u64, p: &Prog, c: &[u8]) {
 }
 
 fn run_seeds(range: std::ops::Range<u64>, gpu_every: u64) -> (usize, usize) {
-    let gpu = matches!(runner::wave32_supported(), Ok(true));
+    let gpu = !fuzz_cpu_only() && matches!(runner::wave32_supported(), Ok(true));
     let mut ran = 0;
     // GPU-run containers whose digest takes each final-block layout.
     let mut tails = [0usize; 2];
@@ -1223,6 +1229,9 @@ outs: {:?}", p.segs, p.outs);
         println!("watch res[{i}]: CPU {exp:x?}; mem[0..70] = {:x?}", &mem[..70.min(mem.len())]);
     }
     println!("seed {seed}: {} bytes, {} instructions, gpu_safe {}", c.len(), instructions(&c), p.gpu_safe);
+    if fuzz_cpu_only() {
+        return runner::skip_test("CPU-only fuzz mode: GPU comparison disabled");
+    }
     if !p.gpu_safe {
         runner::skip_test("seed is validation-only");
         return;
@@ -1296,9 +1305,9 @@ fn shader_flags_follow_plain_instruction_types() {
 #[ignore]
 fn amd_reduced_seeds() {
     use Opnd::{C, V};
-    let gpu = matches!(runner::wave32_supported(), Ok(true));
+    let gpu = !fuzz_cpu_only() && matches!(runner::wave32_supported(), Ok(true));
     if !gpu {
-        eprintln!("SKIPPED: no wave32 GPU");
+        eprintln!("SKIPPED: GPU comparison disabled or no wave32 GPU");
         return;
     }
     let ins = |dst, op| Inst { dst, op };
