@@ -2421,6 +2421,103 @@ mod tests {
     }
 
     #[test]
+    fn cpu_top_mip_masks_cover_every_array_slice_and_keep_gaps_and_packed_tails() {
+        let mut checked = 0;
+        for mips in [2u16, 4, 6] {
+            for slices in [1u16, 2, 6] {
+                for gap in [0usize, 1, 3] {
+                    for reverse in [false, true] {
+                        let desc = D3D12_RESOURCE_DESC { MipLevels: mips, DepthOrArraySize: slices, ..Default::default() };
+                        let mut tilings = vec![D3D12_SUBRESOURCE_TILING::default(); usize::from(mips * slices)];
+                        let mut order: Vec<_> = (0..tilings.len()).collect();
+                        if reverse { order.reverse(); }
+                        let mut owners = Vec::new();
+                        for index in order {
+                            owners.extend(std::iter::repeat_n(None, gap));
+                            let mip = index as u32 % u32::from(mips);
+                            let start = owners.len() as u32;
+                            if mip + 1 == u32::from(mips) {
+                                tilings[index].StartTileIndexInOverallResource = u32::MAX;
+                                owners.push(None); // packed tail: shared, never one skipped mip's tiles
+                            } else {
+                                let n = (u32::from(mips) - mip).min(3);
+                                tilings[index] = D3D12_SUBRESOURCE_TILING { WidthInTiles: n, HeightInTiles: 1, DepthInTiles: 1, StartTileIndexInOverallResource: start };
+                                owners.extend(std::iter::repeat_n(Some(mip), n as usize));
+                            }
+                        }
+                        for skip in 0..=u32::from(mips) {
+                            let expected: Vec<bool> = owners.iter().map(|m| m.is_some_and(|mip| mip < skip)).collect();
+                            assert_eq!(top_mip_mask(&desc, &tilings, owners.len() as u32, skip), expected, "{mips} mips, {slices} slices, gap {gap}, reverse {reverse}, skip {skip}");
+                            checked += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(checked, 270);
+    }
+
+    #[test]
+    fn cpu_mip_skipping_is_minimal_monotone_and_keeps_a_standard_mip() {
+        let mut checked = 0;
+        for largest in [1u64, 2, 3, 127, 128, 129, 511, 512, 513, 1023, 1024, 1025, 16384] {
+            for standard in 0..=15 {
+                let mut previous = 15;
+                for cap in [1, 128, 512, 1024, 2048] {
+                    let skip = mips_to_skip(largest, standard, cap);
+                    assert!(skip < standard.max(1), "the last standard mip is kept");
+                    assert!(skip <= previous, "a looser cap never drops more mips");
+                    if skip > 0 { assert!(largest >> (skip - 1) > cap, "one fewer skipped mip would fit"); }
+                    if skip + 1 < standard { assert!(largest >> skip <= cap, "the retained side exceeds the cap"); }
+                    previous = skip;
+                    checked += 1;
+                }
+            }
+        }
+        assert_eq!(checked, 1040);
+    }
+
+    #[test]
+    fn cpu_mip_clamps_preserve_existing_lod_limits_and_view_ranges() {
+        unsafe fn fields(v: &D3D12_SHADER_RESOURCE_VIEW_DESC) -> ([u32; 5], f32) {
+            match v.ViewDimension {
+                D3D12_SRV_DIMENSION_TEXTURE2D => { let a = v.Anonymous.Texture2D; ([a.MostDetailedMip, a.MipLevels, a.PlaneSlice, 0, 0], a.ResourceMinLODClamp) }
+                D3D12_SRV_DIMENSION_TEXTURE2DARRAY => { let a = v.Anonymous.Texture2DArray; ([a.MostDetailedMip, a.MipLevels, a.FirstArraySlice, a.ArraySize, a.PlaneSlice], a.ResourceMinLODClamp) }
+                D3D12_SRV_DIMENSION_TEXTURECUBE => { let a = v.Anonymous.TextureCube; ([a.MostDetailedMip, a.MipLevels, 0, 0, 0], a.ResourceMinLODClamp) }
+                D3D12_SRV_DIMENSION_TEXTURECUBEARRAY => { let a = v.Anonymous.TextureCubeArray; ([a.MostDetailedMip, a.MipLevels, a.First2DArrayFace, a.NumCubes, 0], a.ResourceMinLODClamp) }
+                _ => unreachable!(),
+            }
+        }
+        let mut checked = 0;
+        for dimension in [D3D12_SRV_DIMENSION_TEXTURE2D, D3D12_SRV_DIMENSION_TEXTURE2DARRAY, D3D12_SRV_DIMENSION_TEXTURECUBE, D3D12_SRV_DIMENSION_TEXTURECUBEARRAY] {
+            for first_mip in [0, 2, 5] {
+                for original_lod in [0.0f32, 1.5, 7.0] {
+                    for skip in [0, 1, 3, 6] {
+                        let format = windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8G8B8A8_UNORM;
+                        let mut v = D3D12_SHADER_RESOURCE_VIEW_DESC { Format: format, ViewDimension: dimension, Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING, ..Default::default() };
+                        match dimension {
+                            D3D12_SRV_DIMENSION_TEXTURE2D => v.Anonymous.Texture2D = D3D12_TEX2D_SRV { MostDetailedMip: first_mip, MipLevels: 7, PlaneSlice: 1, ResourceMinLODClamp: original_lod },
+                            D3D12_SRV_DIMENSION_TEXTURE2DARRAY => v.Anonymous.Texture2DArray = D3D12_TEX2D_ARRAY_SRV { MostDetailedMip: first_mip, MipLevels: 7, PlaneSlice: 1, FirstArraySlice: 2, ArraySize: 3, ResourceMinLODClamp: original_lod },
+                            D3D12_SRV_DIMENSION_TEXTURECUBE => v.Anonymous.TextureCube = D3D12_TEXCUBE_SRV { MostDetailedMip: first_mip, MipLevels: 7, ResourceMinLODClamp: original_lod },
+                            D3D12_SRV_DIMENSION_TEXTURECUBEARRAY => v.Anonymous.TextureCubeArray = D3D12_TEXCUBE_ARRAY_SRV { MostDetailedMip: first_mip, MipLevels: 7, First2DArrayFace: 6, NumCubes: 3, ResourceMinLODClamp: original_lod },
+                            _ => unreachable!(),
+                        }
+                        let before = unsafe { fields(&v) }.0;
+                        clamp_skipped_mips(&mut v, skip);
+                        let (after, lod) = unsafe { fields(&v) };
+                        assert_eq!(after, before);
+                        assert_eq!(v.Format, format);
+                        assert_eq!(v.Shader4ComponentMapping, D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING);
+                        assert_eq!(lod, original_lod.max(skip as f32));
+                        checked += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(checked, 144);
+    }
+
+    #[test]
     fn top_mips_go_until_the_largest_side_fits_and_one_tiled_mip_stays() {
         assert_eq!(mips_to_skip(4096, 13, 2048), 1);
         assert_eq!(mips_to_skip(4096, 13, 1024), 2);
